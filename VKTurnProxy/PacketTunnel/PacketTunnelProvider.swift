@@ -16,6 +16,22 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private var pathMonitor: NWPathMonitor?
     private let pathMonitorQueue = DispatchQueue(label: "com.vkturnproxy.tunnel.pathmonitor")
     private var lastPathDescription: String?
+    // Essential identity = status + iface + ssid + unsatisfiedReason. Excludes
+    // flag-only attributes (dns/expensive/constrained/v4/v6) that iOS toggles
+    // without an actual network change. Used by pathUpdateHandler to gate the
+    // wgPathChanged/wgPathInTransition bridge call: log + pathstats snapshot
+    // still fire on flag-only flips for diagnostic visibility, but the
+    // bridge (which marks slots saturated for 12m) is skipped because no
+    // real path change happened.
+    //
+    // Empirical motivation — vpn.wifi-lte-wifi.2.log 2026-05-15 16:36:
+    //   16:36:22.811  satisfied iface=wifi [v4,ssid="..."]      ← no DNS yet
+    //   16:36:26.057  satisfied iface=wifi [v4,dns,ssid="..."]  ← DNS came up
+    // Without this guard, the second event triggered MarkInUseSlots → 5 slots
+    // saturated for 10m30s + cascade detection extending pause to 30s. No
+    // conn died and no pool acquire was blocked (conns were happy), but pool
+    // capacity was wasted for a phantom event.
+    private var lastPathEssentialIdentity: String?
     // Cached SSID of the current WiFi network. Refreshed asynchronously
     // on every wifi-iface path event via NEHotspotNetwork.fetchCurrent
     // (see startPathMonitoring). Cleared when iface switches off wifi.
@@ -416,13 +432,29 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                     // transient interfaces visited between the 60s pathstats
                     // ticks (e.g. ~20s on cellular during a wifi-cellular-wifi
                     // handover, see vpn.wifi-lte-wifi.1.log 2026-05-08) appear
-                    // in the log stream. Cheap (one log line) and called only
-                    // when the path actually changed (deduped above).
+                    // in the log stream. Cheap (one log line) and called on
+                    // any desc-change (including flag-only flips, which are
+                    // diagnostically interesting even though we skip the
+                    // bridge call below).
                     if self.tunnelHandle >= 0 {
                         let label = desc
                         label.withCString { cstr in
                             wgLogPathSnapshot(self.tunnelHandle, cstr)
                         }
+
+                        // Essential-identity gate: skip the bridge call
+                        // when only flag attributes (dns/expensive/
+                        // constrained/v4/v6) flipped on the same iface +
+                        // ssid + status. Such "events" are iOS internal
+                        // state updates, not real network changes — see
+                        // lastPathEssentialIdentity comment for the
+                        // 2026-05-15 16:36 motivating case.
+                        let essential = self.pathEssentialIdentity(path)
+                        if essential == self.lastPathEssentialIdentity {
+                            self.logMsg("[PathMonitor] flag-only change (\(essential)) — bridge call skipped")
+                            return
+                        }
+                        self.lastPathEssentialIdentity = essential
 
                         // Branch on iface type. `iface=other` satisfied
                         // events almost always mean our own TUN device
@@ -489,6 +521,51 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         pathMonitor?.cancel()
         pathMonitor = nil
         lastPathDescription = nil
+        lastPathEssentialIdentity = nil
+    }
+
+    // pathEssentialIdentity returns a key that captures only the network-
+    // identity attributes of a path: status (satisfied/unsatisfied/
+    // requiresConnection), interface type (wifi/cellular/wired/loopback/
+    // other), SSID for wifi, and unsatisfiedReason for unsatisfied. It
+    // EXCLUDES flag attributes (dns/expensive/constrained/v4/v6) that iOS
+    // toggles on a fixed network without a real change. Used by the
+    // PathMonitor handler to gate the wgPathChanged bridge call so that
+    // iOS-internal flag flips don't trigger full smart-pause marking.
+    //
+    // Safe to call only from the path-handler queue: reads currentWiFiSSID
+    // which is updated on the same queue inside the SSID-fetch callback.
+    private func pathEssentialIdentity(_ path: Network.NWPath) -> String {
+        let status: String
+        switch path.status {
+        case .satisfied: status = "satisfied"
+        case .unsatisfied: status = "unsatisfied"
+        case .requiresConnection: status = "requiresConnection"
+        @unknown default: status = "unknown"
+        }
+        var iface = "none"
+        if path.usesInterfaceType(Network.NWInterface.InterfaceType.wifi) { iface = "wifi" }
+        else if path.usesInterfaceType(Network.NWInterface.InterfaceType.cellular) { iface = "cellular" }
+        else if path.usesInterfaceType(Network.NWInterface.InterfaceType.wiredEthernet) { iface = "wired" }
+        else if path.usesInterfaceType(Network.NWInterface.InterfaceType.loopback) { iface = "loopback" }
+        else if path.usesInterfaceType(Network.NWInterface.InterfaceType.other) { iface = "other" }
+        var components = [status, "iface=\(iface)"]
+        if iface == "wifi", let ssid = currentWiFiSSID {
+            components.append("ssid=\"\(ssid)\"")
+        }
+        if path.status == .unsatisfied {
+            let reason: String
+            switch path.unsatisfiedReason {
+            case .notAvailable: reason = "n/a"
+            case .cellularDenied: reason = "cellular-denied"
+            case .wifiDenied: reason = "wifi-denied"
+            case .localNetworkDenied: reason = "local-net-denied"
+            case .vpnInactive: reason = "vpn-inactive"
+            @unknown default: reason = "unknown"
+            }
+            components.append("reason:\(reason)")
+        }
+        return components.joined(separator: " ")
     }
 
     private func describePath(_ path: Network.NWPath) -> String {
