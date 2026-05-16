@@ -14,7 +14,6 @@ import (
 	"log"
 	mathrand "math/rand"
 	"net/http"
-	"net/http/cookiejar"
 	"net/url"
 	"os"
 	"regexp"
@@ -25,6 +24,10 @@ import (
 	"time"
 
 	"github.com/andybalholm/brotli"
+	fhttp "github.com/bogdanfinn/fhttp"
+	tls_client "github.com/bogdanfinn/tls-client"
+	"github.com/bogdanfinn/tls-client/profiles"
+	utls "github.com/bogdanfinn/utls"
 	"github.com/klauspost/compress/zstd"
 )
 
@@ -121,30 +124,308 @@ func randomHex(n int) string {
 	return hex.EncodeToString(b)
 }
 
-// newSessionClient creates an HTTP client with a shared cookie jar.
+// customSafariIOS26Profile returns a captcha session profile with a
+// hand-crafted TLS ClientHello matching real Safari iOS 26 byte-for-byte,
+// extracted from pcap captured 2026-05-16 (captcha-capture.pcap, frame 32,
+// real Safari WKWebView handshake to api.vk.ru).
 //
-// TLS fingerprint: HelloChrome_Auto (= HelloChrome_133 in uTLS v1.8.2),
-// which is structurally identical to Safari iOS 17 ClientHello. Both
-// browsers converged on the same modern TLS extensions (X25519MLKEM768,
-// ECH, ALPS, Brotli compress_certificate, GREASE positions, extension
-// shuffle, identical cipher list + supported_groups + signature
-// algorithms). HelloIOS_Auto in v1.8.2 maps to HelloIOS_14, which is
-// strictly older and DIFFERENT from real iOS 17 — switching to it
-// would be a downgrade. So Chrome_Auto stays even for the Safari-UA
-// captcha session: at the TLS layer there is no detectable difference
-// between Chrome 133 and Safari iOS 17.
+// Why we don't just use profiles.Safari_IOS_26_0 directly: bogdanfinn's
+// built-in profile (v1.14.0) has three concrete divergences from real
+// Safari iOS 26 that we observed on wire:
 //
-// Phase 4 of the 2026-05-15 PoW regression investigation briefly tried
-// HelloIOS_Auto on the assumption that UA/TLS mismatch was the bot
-// signal — empirically wrong; the previous session had already
-// established TLS identity. Reverted in build 96.
-func newSessionClient() *http.Client {
-	jar, _ := cookiejar.New(nil)
-	return &http.Client{
-		Timeout:   20 * time.Second,
-		Jar:       jar,
-		Transport: newChromeTransport(),
+//   1. CipherSuites: 21 vs 16. Real Safari iOS 26 sends NO 3DES suites
+//      (Apple removed years ago); bogdanfinn includes TLS_..._3DES_EDE_CBC_SHA.
+//      Order also differs: real Safari = AES_128_GCM first, bogdanfinn =
+//      AES_256_GCM first.
+//
+//   2. SupportedCurves: 5 vs 4. Bogdanfinn adds CurveP521 (secp521r1);
+//      real Safari doesn't have it.
+//
+//   3. Extension order: FIXED in bogdanfinn (same JA3 across all
+//      connections); RANDOMIZED in real Safari (different JA3 every
+//      connection due to GREASE + per-connection shuffle).
+//
+//   4. Missing extensions: bogdanfinn lacks encrypted_client_hello
+//      (65037), application_settings (17613 ALPS), session_ticket (35).
+//      Real Safari iOS 17+ sends all three.
+//
+// VK detection likely catches all of these — most damning is #3: 24
+// consecutive Go-solver connections with identical JA3 vs Safari rotating
+// JA3 each connection is an obvious bot signal.
+//
+// HTTP/2 settings (settings, settingsOrder, pseudoHeaderOrder, connection
+// flow, header priority) are taken from profiles.Safari_IOS_26_0 — they
+// match our captured Safari iOS 26 HTTP/2 frames and don't need fixing.
+//
+// Built with RandomExtensionOrder=true to mimic Safari's per-connection
+// shuffling. utls handles the actual randomization internally.
+// buildCustomSafariIOS26Spec returns a uTLS ClientHelloSpec matching the
+// REAL Safari WKWebView TLS fingerprint as observed empirically in pcap
+// captures from the user's iPhone (captcha-capture.3.pcap, 2026-05-16).
+//
+// Phase 9 correction: builds 99-103 (Phase 7-8) targeted a fingerprint
+// that an earlier pcap-analysis sub-agent CLAIMED was real Safari iOS 26
+// (16 ciphers, RandomExtensionOrder=true, ECH+ALPS+session_ticket, no
+// secp521r1). That analysis turned out to be hallucinated. Verified
+// 2026-05-16 by direct tshark inspection: real Safari WKWebView TLS
+// handshakes (8 ClientHellos with cipher_suites_length=28 bytes in the
+// pcap) consistently show 14 ciphers, FIXED extension order (single JA3
+// across all conns), NO ECH/ALPS/session_ticket, WITH secp521r1, and a
+// 10-entry signature_algorithms list including duplicated 0x0805 and
+// legacy 0x0201 (rsa_pkcs1_sha1).
+//
+// Phase 8 was therefore chasing a fictional fingerprint — VK BOT was
+// guaranteed regardless of any further refinement of the wrong target.
+// Phase 9 below is byte-accurate to actual current Safari behavior on
+// this device.
+//
+// Reference: extension order from pcap WebView ClientHello:
+//   GREASE, server_name (0), extended_master_secret (23),
+//   renegotiation_info (65281), supported_groups (10),
+//   ec_point_formats (11), ALPN (16), status_request (5),
+//   signature_algorithms (13), signed_certificate_timestamp (18),
+//   key_share (51), psk_key_exchange_modes (45),
+//   supported_versions (43), compress_certificate (27), GREASE
+//
+// If Phase 9 still triggers BOT on VK while WebView solve succeeds on
+// the same IP within the same minute, detection is provably NOT at
+// TLS/HTTP layer — likely WKWebView-specific attestation (App Attest,
+// WebKit network identity) or JS execution result.
+func buildCustomSafariIOS26Spec() (utls.ClientHelloSpec, error) {
+	return utls.ClientHelloSpec{
+		CipherSuites: []uint16{
+			utls.GREASE_PLACEHOLDER,
+			// TLS 1.3: AES_256_GCM first (real Safari iOS 26 order).
+			utls.TLS_AES_256_GCM_SHA384,
+			utls.TLS_AES_128_GCM_SHA256,
+			utls.TLS_CHACHA20_POLY1305_SHA256,
+			// ECDHE_*_*GCM block. Order from pcap:
+			// c02c (ECDSA AES_256), c030 (RSA AES_256), c02b (ECDSA AES_128),
+			// cca9 (ECDSA CHACHA), c02f (RSA AES_128), cca8 (RSA CHACHA).
+			utls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+			utls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+			utls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+			utls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+			utls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			utls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+			// ECDHE CBC fallbacks: c00a/c009 (ECDSA), c014/c013 (RSA).
+			utls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
+			utls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
+			utls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+			utls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+			// NO RSA bulk ciphers (009c/009d/002f/0035) — real Safari
+			// iOS 26 does not send these despite older Apple devices
+			// did. Phase 8 incorrectly added them.
+			// NO 3DES — Apple removed years ago.
+		},
+		CompressionMethods: []uint8{utls.CompressionNone},
+		// Extensions in EXACT pcap order — RandomExtensionOrder=false
+		// in customSafariIOS26Profile so utls preserves this slice order.
+		Extensions: []utls.TLSExtension{
+			// 1. GREASE
+			&utls.UtlsGREASEExtension{},
+			// 2. server_name (0) — SNI
+			&utls.SNIExtension{},
+			// 3. extended_master_secret (23)
+			&utls.ExtendedMasterSecretExtension{},
+			// 4. renegotiation_info (65281)
+			&utls.RenegotiationInfoExtension{Renegotiation: utls.RenegotiateOnceAsClient},
+			// 5. supported_groups (10) — 6 entries with secp521r1.
+			//    Phase 8 incorrectly omitted secp521r1.
+			&utls.SupportedCurvesExtension{Curves: []utls.CurveID{
+				utls.GREASE_PLACEHOLDER,
+				utls.X25519MLKEM768,
+				utls.X25519,
+				utls.CurveP256,
+				utls.CurveP384,
+				utls.CurveP521,
+			}},
+			// 6. ec_point_formats (11)
+			&utls.SupportedPointsExtension{SupportedPoints: []byte{utls.PointFormatUncompressed}},
+			// 7. ALPN (16)
+			&utls.ALPNExtension{AlpnProtocols: []string{"h2", "http/1.1"}},
+			// 8. status_request (5) — OCSP
+			&utls.StatusRequestExtension{},
+			// 9. signature_algorithms (13) — 10 entries with a DUPLICATED
+			//    PSSWithSHA384 (0x0805 twice) and legacy PKCS1WithSHA1
+			//    (0x0201). Both unusual; both empirically present in
+			//    Safari iOS 26 pcap. Order from pcap.
+			&utls.SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: []utls.SignatureScheme{
+				utls.ECDSAWithP256AndSHA256, // 0x0403
+				utls.PSSWithSHA256,          // 0x0804
+				utls.PKCS1WithSHA256,        // 0x0401
+				utls.ECDSAWithP384AndSHA384, // 0x0503
+				utls.PSSWithSHA384,          // 0x0805
+				utls.PSSWithSHA384,          // 0x0805 — duplicate, intentional, matches pcap
+				utls.PKCS1WithSHA384,        // 0x0501
+				utls.PSSWithSHA512,          // 0x0806
+				utls.PKCS1WithSHA512,        // 0x0601
+				utls.PKCS1WithSHA1,          // 0x0201 — legacy, intentional, matches pcap
+			}},
+			// 10. signed_certificate_timestamp (18)
+			&utls.SCTExtension{},
+			// 11. key_share (51) — GREASE + X25519MLKEM768 + x25519.
+			//     pcap shows total len=1263 → 4(GREASE+len)+1(GREASE data)
+			//     + 4(MLKEM768 hdr)+1216(MLKEM768 key) + 4(x25519 hdr)
+			//     +32(x25519 key) = 1265-2 (outer len) = 1263. Match.
+			&utls.KeyShareExtension{KeyShares: []utls.KeyShare{
+				{Group: utls.CurveID(utls.GREASE_PLACEHOLDER), Data: []byte{0}},
+				{Group: utls.X25519MLKEM768},
+				{Group: utls.X25519},
+			}},
+			// 12. psk_key_exchange_modes (45)
+			&utls.PSKKeyExchangeModesExtension{Modes: []uint8{utls.PskModeDHE}},
+			// 13. supported_versions (43) — GREASE, TLS1.3, TLS1.2
+			&utls.SupportedVersionsExtension{Versions: []uint16{
+				utls.GREASE_PLACEHOLDER,
+				utls.VersionTLS13,
+				utls.VersionTLS12,
+			}},
+			// 14. compress_certificate (27) — brotli only
+			&utls.UtlsCompressCertExtension{Algorithms: []utls.CertCompressionAlgo{
+				utls.CertCompressionBrotli,
+			}},
+			// 15. GREASE
+			&utls.UtlsGREASEExtension{},
+			// NO ECH (65037), NO ALPS (17613), NO session_ticket (35).
+			// Phase 8 added all three based on hallucinated agent
+			// analysis; real Safari iOS 26 sends none of them.
+		},
+	}, nil
+}
+
+// customSafariIOS26Profile wraps buildCustomSafariIOS26Spec into a bogdanfinn
+// ClientProfile, reusing HTTP/2 settings from profiles.Safari_IOS_26_0 (they
+// already matched our captured Safari iOS 26 HTTP/2 frames byte-for-byte and
+// don't need overriding — only ClientHello did).
+//
+// Phase 9 (build 104): RandomExtensionOrder set to FALSE. Real Safari sends
+// IDENTICAL extension order across every connection (verified by single JA3
+// hash 8527da8b8a640065e72ec6b6f99764f3 across 8 WebView ClientHellos in
+// the same pcap). Earlier Phase 8 had this set to true based on the
+// hallucinated "Safari randomizes JA3" claim.
+func customSafariIOS26Profile() profiles.ClientProfile {
+	helloID := utls.ClientHelloID{
+		Client:               "Safari_iOS_26_custom",
+		RandomExtensionOrder: false, // FIXED — matches real Safari empirically
+		Version:              "2.0", // Phase 9: byte-accurate from pcap, no longer hallucinated
+		Seed:                 nil,
+		SpecFactory:          buildCustomSafariIOS26Spec,
 	}
+	base := profiles.Safari_IOS_26_0
+	return profiles.NewClientProfile(
+		helloID,
+		base.GetSettings(),
+		base.GetSettingsOrder(),
+		base.GetPseudoHeaderOrder(),
+		base.GetConnectionFlow(),
+		base.GetPriorities(),
+		base.GetHeaderPriority(),
+		base.GetStreamID(),
+		base.GetAllowHTTP(),
+		base.GetHttp3Settings(),
+		base.GetHttp3SettingsOrder(),
+		base.GetHttp3PriorityParam(),
+		base.GetHttp3PseudoHeaderOrder(),
+		base.GetHttp3SendGreaseFrames(),
+	)
+}
+
+// newSessionClient creates a captcha session client via bogdanfinn/tls-client
+// using customSafariIOS26Profile (our own byte-accurate Safari iOS 26
+// ClientHello extracted from real WKWebView pcap 2026-05-16).
+//
+// Phase 7 (build 99-100) used profiles.Safari_IOS_26_0 from bogdanfinn but
+// pcap analysis showed bogdanfinn's profile diverges from real Safari iOS
+// 26 on cipher list, supported_groups, missing ECH/ALPS/session_ticket,
+// and fixed-vs-randomized extension order. Phase 8 uses our custom spec
+// matching capture exactly. See customSafariIOS26Profile for the
+// extracted differences.
+//
+// HTTP/2 settings + connection flow remain from bogdanfinn's
+// Safari_IOS_26_0 — those matched our capture and don't need overriding.
+//
+// Other call sites (creds.go / proxy.go) keep their stdlib *http.Client
+// + uTLS Chrome transport unchanged — those flows have Chrome UA and
+// Chrome JA3, which is internally consistent.
+// Phase 10 (build 105): SESSION-UNIFIED FINGERPRINT.
+//
+// Previously each captcha solver attempt created a fresh bogdanfinn HttpClient
+// (Phase 9 Safari profile + fresh cookie jar) while creds.go bootstrap requests
+// used a SEPARATE std http.Client with uTLS Chrome transport + random Chrome UA.
+//
+// pcap analysis 2026-05-16 (captcha-capture.4.pcap) proved:
+//   - bootstrap requests to api.vk.ru: 16 ciphers, RANDOM JA3 per conn (uTLS Chrome)
+//   - captcha requests to api.vk.ru: 14 ciphers, FIXED JA3 8527da8b... (Phase 9 Safari)
+//   - SAME session_token spans both → VK sees impossible fingerprint switch → BOT
+//
+// VK's 2026-05-15 detection update likely added session-level fingerprint
+// consistency checking. Real Safari WKWebView uses ONE TLS profile + ONE UA
+// for all requests in a session. Phase 10 makes us match.
+//
+// Singleton bogdanfinn HttpClient — created once per process, shared across
+// creds.go bootstrap + captcha_pow.go solver. Cookies accumulate naturally
+// like a real browser session. ALL VK API requests (login.vk.ru, api.vk.ru,
+// calls.okcdn.ru, id.vk.ru) flow through THIS one client.
+var (
+	sessionClientOnce sync.Once
+	sessionClient     tls_client.HttpClient
+)
+
+// GetSessionClient returns the singleton bogdanfinn HttpClient configured with
+// Phase 9 Safari iOS 26 TLS profile + persistent cookie jar. Same instance
+// returned across the whole process lifetime — cookies and connection state
+// persist. Exported (capitalized) so creds.go and proxy.go can call it.
+func GetSessionClient() tls_client.HttpClient {
+	sessionClientOnce.Do(func() {
+		// Phase 9 spec diagnostic — confirms what TLS bytes we send.
+		// Phase 10 expected: ciphers=14 extensions=15 random_ext_order=false.
+		spec, err := buildCustomSafariIOS26Spec()
+		if err != nil {
+			log.Printf("pow: TLS profile spec build ERROR: %v", err)
+		} else {
+			log.Printf("pow: TLS profile=Safari_iOS_26_custom ciphers=%d extensions=%d random_ext_order=false (Phase 9 spec, Phase 10 session-unified across bootstrap+captcha)",
+				len(spec.CipherSuites), len(spec.Extensions))
+		}
+
+		jar := tls_client.NewCookieJar()
+		options := []tls_client.HttpClientOption{
+			tls_client.WithTimeoutSeconds(20),
+			tls_client.WithClientProfile(customSafariIOS26Profile()),
+			tls_client.WithCookieJar(jar),
+		}
+		client, cerr := tls_client.NewHttpClient(tls_client.NewNoopLogger(), options...)
+		if cerr != nil {
+			log.Printf("pow: ERROR creating bogdanfinn session client: %v", cerr)
+			return
+		}
+		sessionClient = client
+	})
+	return sessionClient
+}
+
+// GetSessionUserAgent returns the User-Agent string ALL VK API requests in
+// this process should use. Returns the captured Safari WKWebView UA from
+// vk_profile.json when available (the same UA that computed the captured
+// browser_fp). Falls back to a generic recent Safari iOS UA when no profile
+// has been captured yet (cold start before first WebView solve).
+//
+// Phase 10: replaces creds.go's randomUserAgent() — random Chrome UAs were
+// inconsistent with the Safari TLS profile and with the captured browser_fp.
+func GetSessionUserAgent() string {
+	if saved := loadSavedVKProfile(); saved != nil && saved.UserAgent != "" {
+		return saved.UserAgent
+	}
+	// Fallback for cold start (pre-first-WebView): generic recent Safari iOS.
+	// Matches the Phase 9 TLS family at least; browser_fp will also be
+	// generated (not captured) until WebView completes.
+	return "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+}
+
+// newSessionClient is the legacy name for backwards compatibility. New code
+// should call GetSessionClient directly.
+func newSessionClient() tls_client.HttpClient {
+	return GetSessionClient()
 }
 
 // newHTTPClient creates a fresh http.Client (no cookie jar) with Chrome TLS fingerprint.
@@ -189,7 +470,7 @@ func solveCaptchaPoW(ctx context.Context, redirectURI, captchaSID, userAgent str
 
 	// Single HTTP client with cookie jar for the entire captcha session.
 	client := newSessionClient()
-	defer client.CloseIdleConnections()
+	// (bogdanfinn HttpClient has no CloseIdleConnections; profile pool is reused via package-level state)
 
 	// Random initial delay (1.5-2.5s) — HAR timing from real browser
 	delay := time.Duration(1500+mathrand.Intn(1000)) * time.Millisecond
@@ -213,13 +494,13 @@ func solveCaptchaPoW(ctx context.Context, redirectURI, captchaSID, userAgent str
 	// constant via a JS bump auto-invalidates.
 	debugInfo := fetchAndCacheDebugInfo(ctx, client, scriptURL)
 
-	// Log cookies received from page load (for debugging)
+	// Log cookies received from page load (for debugging) — bogdanfinn API
 	if parsedURL, e := url.Parse("https://id.vk.ru"); e == nil {
-		cookies := client.Jar.Cookies(parsedURL)
+		cookies := client.GetCookies(parsedURL)
 		log.Printf("pow: received %d cookies from page load", len(cookies))
 	}
 	if parsedURL, e := url.Parse("https://vk.ru"); e == nil {
-		cookies := client.Jar.Cookies(parsedURL)
+		cookies := client.GetCookies(parsedURL)
 		log.Printf("pow: received %d cookies from vk.ru domain", len(cookies))
 	}
 
@@ -291,14 +572,14 @@ const hardcodedDebugInfo = "a0ac4896e9b899f78d905fd37c5adb2b768aa955eb7b2a7bcba6
 // constant in a future JS version (bumping the vkid/X.Y.Z path), we
 // pick it up automatically; build 93's hardcoded value would have
 // become stale.
-func fetchAndCacheDebugInfo(ctx context.Context, client *http.Client, scriptURL string) string {
+func fetchAndCacheDebugInfo(ctx context.Context, client tls_client.HttpClient, scriptURL string) string {
 	if scriptURL == "" {
 		return hardcodedDebugInfo
 	}
 	if cached, ok := debugInfoCache.Load(scriptURL); ok {
 		return cached.(string)
 	}
-	req, err := http.NewRequestWithContext(ctx, "GET", scriptURL, nil)
+	req, err := fhttp.NewRequestWithContext(ctx, "GET", scriptURL, nil)
 	if err != nil {
 		log.Printf("pow: debug_info fetch req-build failed (%v) — falling back to hardcoded constant", err)
 		return hardcodedDebugInfo
@@ -317,7 +598,7 @@ func fetchAndCacheDebugInfo(ctx context.Context, client *http.Client, scriptURL 
 		return hardcodedDebugInfo
 	}
 	defer func() { _ = resp.Body.Close() }()
-	body, err := readDecompressedBody(resp)
+	body, err := io.ReadAll(resp.Body) // bogdanfinn auto-decompresses gzip
 	if err != nil {
 		log.Printf("pow: debug_info read body failed (%v) — falling back to hardcoded constant", err)
 		return hardcodedDebugInfo
@@ -338,8 +619,8 @@ func fetchAndCacheDebugInfo(ctx context.Context, client *http.Client, scriptURL 
 // 1.1.1331/not_robot_captcha.js), used by fetchAndCacheDebugInfo to
 // extract the version-specific debug_info constant. Empty if extraction
 // fails (caller falls back to hardcodedDebugInfo).
-func fetchPoW(ctx context.Context, client *http.Client, redirectURI string) (powInput string, difficulty int, scriptURL string, htmlSettings map[string]interface{}, err error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", redirectURI, nil)
+func fetchPoW(ctx context.Context, client tls_client.HttpClient, redirectURI string) (powInput string, difficulty int, scriptURL string, htmlSettings map[string]interface{}, err error) {
+	req, err := fhttp.NewRequestWithContext(ctx, "GET", redirectURI, nil)
 	if err != nil {
 		return "", 0, "", nil, err
 	}
@@ -370,7 +651,7 @@ func fetchPoW(ctx context.Context, client *http.Client, redirectURI string) (pow
 
 	log.Printf("pow: fetchPoW HTTP status=%d", resp.StatusCode)
 
-	body, err := readDecompressedBody(resp)
+	body, err := io.ReadAll(resp.Body) // bogdanfinn auto-decompresses gzip
 	if err != nil {
 		return "", 0, "", nil, fmt.Errorf("read body (Content-Encoding=%q): %w",
 			resp.Header.Get("Content-Encoding"), err)
@@ -380,8 +661,8 @@ func fetchPoW(ctx context.Context, client *http.Client, redirectURI string) (pow
 	// replays them on subsequent api.vk.ru POSTs. Verify our jar does the
 	// same — if it shows zero cookies after the page GET, that's a strong
 	// signal the missing cookies are part of the BOT detection.
-	logCookiesForURL(client.Jar, "https://api.vk.ru", "fetchPoW post-GET (api.vk.ru)")
-	logCookiesForURL(client.Jar, "https://id.vk.ru", "fetchPoW post-GET (id.vk.ru)")
+	logCookiesForURL(client, "https://api.vk.ru", "fetchPoW post-GET (api.vk.ru)")
+	logCookiesForURL(client, "https://id.vk.ru", "fetchPoW post-GET (id.vk.ru)")
 	html := string(body)
 
 	powRe := regexp.MustCompile(`const\s+powInput\s*=\s*"([^"]+)"`)
@@ -448,42 +729,39 @@ func solvePoW(powInput string, difficulty int) string {
 	return ""
 }
 
-// readDecompressedBody reads an HTTP response body, transparently
-// decompressing it based on the Content-Encoding header. Needed because
-// when we set Accept-Encoding manually (gzip, deflate, br, zstd — to
-// match Safari's TLS+HTTP fingerprint), Go's HTTP transport disables
-// its built-in transparent gzip decompression and hands us the raw
-// compressed bytes. We have to handle decoding ourselves.
+// readDecompressedBody decodes an HTTP response body based on the given
+// Content-Encoding string. Decoupled from http.Response / fhttp.Response
+// types so it works with either (Phase 7 introduced fhttp via
+// bogdanfinn/tls-client; std net/http still used in non-captcha paths).
 //
-// Why we set the header explicitly: Safari iOS 17 sends all four
-// algorithms; Go's default (when header unset) is just `gzip`. The
-// difference is a one-bit fingerprint VK can use to flag us as bot.
-// See Phase 3 of the 2026-05-15 PoW regression investigation.
+// Needed because when we set Accept-Encoding manually (gzip, deflate,
+// br, zstd — to match Safari's HTTP fingerprint), neither std nor
+// bogdanfinn transports auto-decompress reliably; we have to handle it.
 //
 // brotli + zstd come from indirect deps already in go.sum (used by
 // klauspost/compress and andybalholm/brotli transitively).
-func readDecompressedBody(resp *http.Response) ([]byte, error) {
-	enc := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding")))
+func readDecompressedBody(body io.Reader, encoding string) ([]byte, error) {
+	enc := strings.ToLower(strings.TrimSpace(encoding))
 	var reader io.Reader
 	switch enc {
 	case "", "identity":
-		reader = resp.Body
+		reader = body
 	case "gzip":
-		gz, err := gzip.NewReader(resp.Body)
+		gz, err := gzip.NewReader(body)
 		if err != nil {
 			return nil, fmt.Errorf("gzip decoder init: %w", err)
 		}
 		defer func() { _ = gz.Close() }()
 		reader = gz
 	case "deflate":
-		zr := flate.NewReader(resp.Body)
+		zr := flate.NewReader(body)
 		defer func() { _ = zr.Close() }()
 		reader = zr
 	case "br":
 		// brotli.Reader has no Close (just an io.Reader).
-		reader = brotli.NewReader(resp.Body)
+		reader = brotli.NewReader(body)
 	case "zstd":
-		zr, err := zstd.NewReader(resp.Body)
+		zr, err := zstd.NewReader(body)
 		if err != nil {
 			return nil, fmt.Errorf("zstd decoder init: %w", err)
 		}
@@ -508,14 +786,18 @@ const safariAcceptEncoding = "gzip, deflate, br, zstd"
 // position-by-position comparison with Safari capture 2026-05-15.
 const accessTokenSuffix = "&access_token="
 
-// logCookiesForURL logs the names of cookies that the jar would send to
-// the given URL. Used for diagnostic visibility into whether the captcha
-// session client is correctly accumulating + replaying VK cookies (real
-// Safari sends remixlang/remixstid/remixstlid; we should too after the
-// initial id.vk.ru GET in fetchPoW). Phase 3 diagnostic.
-func logCookiesForURL(jar http.CookieJar, rawURL, label string) {
-	if jar == nil {
-		log.Printf("pow: %s cookie jar is nil", label)
+// logCookiesForURL logs the names of cookies that the bogdanfinn captcha
+// session client would send to the given URL. Used for diagnostic
+// visibility into whether the captcha session jar correctly accumulates
+// + replays VK cookies (real Safari sends remixlang/remixstid/remixstlid;
+// we should too after the initial id.vk.ru GET in fetchPoW). Phase 3
+// diagnostic, updated for tls_client.HttpClient in Phase 7.
+//
+// tls_client.HttpClient.GetCookies(url) returns the cookies the jar
+// holds for that URL — same semantics as net/http CookieJar.Cookies.
+func logCookiesForURL(client tls_client.HttpClient, rawURL, label string) {
+	if client == nil {
+		log.Printf("pow: %s captcha session client is nil", label)
 		return
 	}
 	u, err := url.Parse(rawURL)
@@ -523,7 +805,7 @@ func logCookiesForURL(jar http.CookieJar, rawURL, label string) {
 		log.Printf("pow: %s cookie URL parse failed: %v", label, err)
 		return
 	}
-	cookies := jar.Cookies(u)
+	cookies := client.GetCookies(u)
 	if len(cookies) == 0 {
 		log.Printf("pow: %s NO cookies in jar for %s", label, u.Host)
 		return
@@ -598,10 +880,10 @@ func getSessionAdFp() string {
 // IMPORTANT: the `id` query param is a SEPARATE random ID from the adFp
 // value sent to VK. Safari capture confirmed they differ within one session.
 // sync-loader.js generates two independent 21-char IDs.
-func fetchAdFpPing(ctx context.Context, client *http.Client) {
+func fetchAdFpPing(ctx context.Context, client tls_client.HttpClient) {
 	pingID := genAdFp() // same generator, different value from the body adFp
 	pingURL := "https://privacy-cs.mail.ru/fp/?id=" + pingID
-	req, err := http.NewRequestWithContext(ctx, "GET", pingURL, nil)
+	req, err := fhttp.NewRequestWithContext(ctx, "GET", pingURL, nil)
 	if err != nil {
 		log.Printf("pow: fetchAdFpPing skipped (request creation failed: %v)", err)
 		return
@@ -632,10 +914,10 @@ func fetchAdFpPing(ctx context.Context, client *http.Client) {
 //
 // Returns (successToken, lastShowCaptchaType, err). See solveCaptchaPoW for
 // the meaning of lastShowCaptchaType.
-func callCaptchaNotRobotAPI(ctx context.Context, client *http.Client, sessionToken, hash, adFp, debugInfo string, htmlSettings map[string]interface{}) (string, string, error) {
+func callCaptchaNotRobotAPI(ctx context.Context, client tls_client.HttpClient, sessionToken, hash, adFp, debugInfo string, htmlSettings map[string]interface{}) (string, string, error) {
 	vkReq := func(method, postData string) (map[string]interface{}, error) {
 		reqURL := "https://api.vk.ru/method/" + method + "?v=5.131"
-		req, err := http.NewRequestWithContext(ctx, "POST", reqURL, strings.NewReader(postData))
+		req, err := fhttp.NewRequestWithContext(ctx, "POST", reqURL, strings.NewReader(postData))
 		if err != nil {
 			return nil, err
 		}
@@ -667,7 +949,7 @@ func callCaptchaNotRobotAPI(ctx context.Context, client *http.Client, sessionTok
 		// captchaNotRobot.* call; we should too after fetchPoW (which
 		// GETs id.vk.ru/not_robot_captcha and should accumulate
 		// Set-Cookie headers in the shared jar).
-		logCookiesForURL(client.Jar, reqURL, method)
+		logCookiesForURL(client, reqURL, method)
 
 		httpResp, err := client.Do(req)
 		if err != nil {
@@ -675,7 +957,7 @@ func callCaptchaNotRobotAPI(ctx context.Context, client *http.Client, sessionTok
 		}
 		defer func() { _ = httpResp.Body.Close() }()
 
-		body, err := readDecompressedBody(httpResp)
+		body, err := io.ReadAll(httpResp.Body) // bogdanfinn auto-decompresses gzip
 		if err != nil {
 			return nil, fmt.Errorf("read body (Content-Encoding=%q): %w",
 				httpResp.Header.Get("Content-Encoding"), err)

@@ -8,7 +8,6 @@ import (
 	"io"
 	"log"
 	mathrand "math/rand"
-	"net/http"
 	neturl "net/url"
 	"os"
 	"path/filepath"
@@ -18,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	fhttp "github.com/bogdanfinn/fhttp"
 	"github.com/google/uuid"
 )
 
@@ -227,21 +227,51 @@ func GetVKCreds(linkID string, captchaSolver CaptchaSolver, solvedCaptchaSID, so
 }
 
 func getVKCredsWithClientID(linkID string, vc vkCredentials, captchaSolver CaptchaSolver, solvedCaptchaSID, solvedCaptchaKey string, solvedCaptchaTs, solvedCaptchaAttempt float64, savedToken1 string) (*TURNCreds, error) {
-	// Randomize identity for anti-detection: different UA and name per credential fetch.
-	ua := randomUserAgent()
+	// Phase 10 (build 105) session-unified identity:
+	//
+	// All bootstrap requests below (login.vk.ru, api.vk.ru, calls.okcdn.ru)
+	// now go through the SAME bogdanfinn HttpClient (Phase 9 Safari TLS
+	// profile + shared cookie jar) that captcha_pow.go's solveCaptchaPoW
+	// uses. Phase 9 + UA were the captcha-solver-only ID; bootstrap kept
+	// leaking uTLS Chrome + random Chrome UA. VK's 2026-05-15 detection
+	// update started catching the mismatch as BOT.
+	//
+	// UA: captured Safari WKWebView UA from vk_profile.json (same one
+	// that computed the captured browser_fp). Falls back to generic Safari
+	// iOS for cold start (pre-first-WebView). Previously: randomUserAgent()
+	// returned a random Chrome desktop UA every call — guaranteed identity
+	// inconsistency across requests AND with the Safari TLS profile.
+	ua := GetSessionUserAgent()
 	name := generateName()
 	escapedName := neturl.QueryEscape(name)
-	log.Printf("vk: identity — name: %s, UA: %s", name, ua)
+	log.Printf("vk: identity — name: %s, UA: %s (Phase 10 session-unified)", name, ua)
 
 	doRequest := func(data string, url string) (resp map[string]interface{}, err error) {
-		client := newHTTPClient()
-		defer client.CloseIdleConnections()
-		req, err := http.NewRequest("POST", url, bytes.NewBuffer([]byte(data)))
+		client := GetSessionClient() // Phase 10: shared singleton with captcha solver
+		// fhttp.NewRequest (NOT std http.NewRequest) — bogdanfinn HttpClient
+		// only accepts fhttp.Request. fhttp is bogdanfinn's fork of net/http
+		// that integrates with their HTTP/2 implementation.
+		req, err := fhttp.NewRequest("POST", url, bytes.NewBuffer([]byte(data)))
 		if err != nil {
 			return nil, err
 		}
-		req.Header.Add("User-Agent", ua)
-		req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+		// Safari WKWebView header set — matches captcha_pow.go's vkReq
+		// helper used for captchaNotRobot.*. Origin/Referer = id.vk.ru
+		// because real Safari WebView captcha context loads from there;
+		// VK API expects calls from that origin.
+		req.Header.Set("User-Agent", ua)
+		req.Header.Set("Accept", "*/*")
+		req.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
+		req.Header.Set("Accept-Language", "en-GB,en;q=0.9")
+		req.Header.Set("Cache-Control", "no-cache")
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("Origin", "https://id.vk.ru")
+		req.Header.Set("Pragma", "no-cache")
+		req.Header.Set("Priority", "u=3, i")
+		req.Header.Set("Referer", "https://id.vk.ru/")
+		req.Header.Set("Sec-Fetch-Dest", "empty")
+		req.Header.Set("Sec-Fetch-Mode", "cors")
+		req.Header.Set("Sec-Fetch-Site", "same-site")
 
 		httpResp, err := client.Do(req)
 		if err != nil {
@@ -249,6 +279,7 @@ func getVKCredsWithClientID(linkID string, vc vkCredentials, captchaSolver Captc
 		}
 		defer func() { _ = httpResp.Body.Close() }()
 
+		// bogdanfinn auto-decompresses gzip; io.ReadAll yields plain bytes.
 		body, err := io.ReadAll(httpResp.Body)
 		if err != nil {
 			return nil, err

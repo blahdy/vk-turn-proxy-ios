@@ -12,7 +12,6 @@ import (
 	mathrand "math/rand"
 	"net"
 	neturl "net/url"
-	"net/http"
 	"runtime"
 	"sort"
 	"strings"
@@ -20,6 +19,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	fhttp "github.com/bogdanfinn/fhttp"
+	tls_client "github.com/bogdanfinn/tls-client"
 	"github.com/cbeuw/connutil"
 	"github.com/pion/dtls/v3"
 	"github.com/pion/dtls/v3/pkg/crypto/selfsign"
@@ -1424,11 +1425,13 @@ func (p *Proxy) RefreshCaptchaURL() string {
 
 	// Pick a random client_id for the fresh request
 	vc := vkCredentialsList[mathrand.Intn(len(vkCredentialsList))]
-	ua := randomUserAgent()
+	// Phase 10 session-unified identity: share the same TLS profile + UA
+	// + cookie jar as creds.go bootstrap and captcha_pow.go solver. See
+	// captcha_pow.go GetSessionClient docstring for rationale.
+	ua := GetSessionUserAgent()
 	name := generateName()
 
-	client := newHTTPClient()
-	defer client.CloseIdleConnections()
+	client := GetSessionClient() // Phase 10: singleton (no Close needed)
 
 	// Step 1: get anon token
 	step1Data := fmt.Sprintf("client_id=%s&token_type=messages&client_secret=%s&version=1&app_id=%s", vc.ClientID, vc.ClientSecret, vc.ClientID)
@@ -1479,13 +1482,28 @@ func (p *Proxy) RefreshCaptchaURL() string {
 }
 
 // doSimplePost is a helper for RefreshCaptchaURL.
-func doSimplePost(client *http.Client, data, url, ua string) (map[string]interface{}, error) {
-	req, err := http.NewRequest("POST", url, strings.NewReader(data))
+// Phase 10: takes bogdanfinn tls_client.HttpClient (was *http.Client) so it
+// uses the shared session client — Safari iOS 26 Phase 9 TLS + cookie jar
+// + captured UA — matching all other VK API requests in this process.
+func doSimplePost(client tls_client.HttpClient, data, url, ua string) (map[string]interface{}, error) {
+	req, err := fhttp.NewRequest("POST", url, strings.NewReader(data))
 	if err != nil {
 		return nil, err
 	}
+	// Same Safari header set as creds.go doRequest and captcha_pow.go vkReq.
 	req.Header.Set("User-Agent", ua)
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
+	req.Header.Set("Accept-Language", "en-GB,en;q=0.9")
+	req.Header.Set("Cache-Control", "no-cache")
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", "https://id.vk.ru")
+	req.Header.Set("Pragma", "no-cache")
+	req.Header.Set("Priority", "u=3, i")
+	req.Header.Set("Referer", "https://id.vk.ru/")
+	req.Header.Set("Sec-Fetch-Dest", "empty")
+	req.Header.Set("Sec-Fetch-Mode", "cors")
+	req.Header.Set("Sec-Fetch-Site", "same-site")
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
