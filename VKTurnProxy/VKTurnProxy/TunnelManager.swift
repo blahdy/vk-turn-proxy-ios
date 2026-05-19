@@ -1466,7 +1466,18 @@ struct TunnelConfig {
     // 32-byte ChaCha20 key as 64 hex chars; required when useWrap=true,
     // must match the server's -wrap-key value exactly.
     var wrapKeyHex: String = ""
-    var useUDP: Bool = true
+    // 2026-05-18 empirical: VK's new per-cred TURN allocation-rate
+    // throttle (introduced ~16:00 MSK that day) applies ONLY to UDP-
+    // transport allocations. 11×10 = 110 TCP-control allocations on a
+    // single cred = 0 quota errors, vs ~36-58% quota errors on UDP for
+    // the same cred. Blackhole rate (~58%) and shape rate (~12-17%) are
+    // unchanged between transports — those mechanisms operate on the
+    // forwarded UDP payload, not on the control channel. Switching to
+    // TCP-control client↔relay leg restores pool stability without
+    // architectural churn (no need for connsPerSlot=2 / pool=18 etc).
+    // Bonus: some ISP whitelists drop UDP entirely but pass TCP, so this
+    // also helps for that class of restricted networks.
+    var useUDP: Bool = false
     var numConnections: Int = 30 // configurable from Settings; VK allows ~10 simultaneous TURN allocations per cred set, so 30 conns spreads over ceil(N/10) = 3 cred sets plus a "+1 reserve" (4 total slots). 30 strikes a useful balance: enough parallelism for high-throughput single sessions, few enough to avoid overwhelming VK's per-IP rate-limit on cred refresh.
     // Per-slot cooldown after a failed fetch (typically captcha required).
     // Slot stays in cooldown for this long before being eligible to retry.
