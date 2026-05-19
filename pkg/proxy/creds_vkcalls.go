@@ -186,12 +186,26 @@ func getVKCredsViaVKCallsPath(linkID string) (*TURNCreds, error) {
 	log.Printf("vkcalls: step3 OK, OK anonymToken (%d chars)", len(okAnonymToken))
 
 	// Step 4: OK auth.anonymLogin → session_key.
-	// IDENTICAL to legacy step 3 (creds.go:543) — same OK endpoint, same
-	// session_data shape, same application_key.
+	// Endpoint and application_key match legacy step 3 (creds.go:543).
+	//
+	// 2026-05-19: removed `client_type:"SDK_JS"` from session_data after
+	// frida-tracing real VK Calls iOS app (build 4282) on PlayCover —
+	// captured anonymLogin request shows VK Calls iOS sends
+	// {"version":2,"device_id":"...","client_version":"1.0.1"} with NO
+	// client_type field at all. "SDK_JS" was inherited from web-SDK pattern
+	// and was a small fingerprint mismatch with the native iOS client we
+	// are nominally identifying as (via User-Agent and application_key).
+	// Empirically verified: anonymLogin succeeds without client_type — VK
+	// returns a valid session_key, and downstream vchat.joinConversationByLink
+	// returns identical turn_server.urls / stun_server / wt_endpoint as with
+	// the SDK_JS variant. No behavioral change on the cred-fetch side; the
+	// motivation is reducing one bot-signal data point in case VK ever
+	// fingerprints session_data shape against announced UA.
+	// client_version bumped 1.1 → "1.0.1" (string, matching VK Calls iOS).
 	okDeviceID := uuid.New().String()
 	step4URL := "https://calls.okcdn.ru/fb.do?session_data=" +
 		neturl.QueryEscape(fmt.Sprintf(
-			`{"version":2,"device_id":"%s","client_version":1.1,"client_type":"SDK_JS"}`, okDeviceID,
+			`{"version":2,"device_id":"%s","client_version":"1.0.1"}`, okDeviceID,
 		)) +
 		"&method=auth.anonymLogin&format=JSON&application_key=CGMMEJLGDIHBABABA"
 	resp4, err := doRequest(step4URL)
