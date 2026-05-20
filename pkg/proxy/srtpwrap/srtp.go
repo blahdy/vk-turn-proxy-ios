@@ -465,6 +465,20 @@ type wrappedConn struct {
 	// stopDemux is set on the client side so Close() unwinds the
 	// background packet demux goroutine.
 	stopDemux func()
+
+	// Per-side reusable scratch buffers. rxDecBuf is owned by the Read
+	// goroutine, txMarshalBuf + txEncBuf by the Write goroutine. No
+	// mutex needed because runSRTPSession dedicates one goroutine to
+	// Read and one to Write per wrappedConn — they don't race against
+	// each other on these fields. Buffers grow on demand to the largest
+	// packet ever seen on this conn, then stay sized for subsequent
+	// reuse so the per-packet path becomes alloc-free on the steady
+	// state. Cuts ~4 allocations per packet (DecryptRTP plaintext
+	// output, RTP marshal output, SRTP encrypt output, plus the small
+	// header struct internal allocs pion sometimes does).
+	rxDecBuf     []byte
+	txMarshalBuf []byte
+	txEncBuf     []byte
 }
 
 func newWrappedConn(underlay net.PacketConn, remote net.Addr, dconn *dtls.Conn,
@@ -515,7 +529,14 @@ func (c *wrappedConn) Read(b []byte) (int, error) {
 			if !ok {
 				return 0, net.ErrClosed
 			}
-			plain, err := c.decCtx.DecryptRTP(nil, pkt, nil)
+			// Reuse c.rxDecBuf for plaintext output. DecryptRTP appends
+			// to the provided dst; passing an empty-but-cap'd slice of
+			// our owned buffer keeps the decryption alloc-free once
+			// the buffer has grown to the largest packet seen.
+			if cap(c.rxDecBuf) < len(pkt) {
+				c.rxDecBuf = make([]byte, 0, len(pkt)+64)
+			}
+			plain, err := c.decCtx.DecryptRTP(c.rxDecBuf[:0], pkt, nil)
 			if err != nil {
 				// SRTP decrypt failures should be rare in steady state
 				// (would indicate key mismatch or replay-window issue).
@@ -525,6 +546,9 @@ func (c *wrappedConn) Read(b []byte) (int, error) {
 				log.Printf("srtpwrap: wrappedConn.Read[%s]: DecryptRTP failed: %v (pkt %d bytes)", c.remote, err, len(pkt))
 				continue
 			}
+			// plain shares backing with c.rxDecBuf; remember it grew so
+			// the next iteration sees the larger capacity.
+			c.rxDecBuf = plain[:0]
 			var hdr rtp.Header
 			n, err := hdr.Unmarshal(plain)
 			if err != nil {
@@ -560,14 +584,32 @@ func (c *wrappedConn) Write(b []byte) (int, error) {
 		},
 		Payload: b,
 	}
-	raw, err := pkt.Marshal()
+	// Reuse c.txMarshalBuf — pkt.MarshalTo writes the serialized RTP
+	// header+payload into the supplied buffer. By sizing the buffer
+	// once to MarshalSize() we avoid the allocation that pkt.Marshal()
+	// would do per call.
+	needSize := pkt.MarshalSize()
+	if cap(c.txMarshalBuf) < needSize {
+		c.txMarshalBuf = make([]byte, needSize+64)
+	}
+	rawLen, err := pkt.MarshalTo(c.txMarshalBuf[:needSize])
 	if err != nil {
 		return 0, fmt.Errorf("rtp marshal: %w", err)
 	}
-	enc, err := c.encCtx.EncryptRTP(nil, raw, nil)
+	raw := c.txMarshalBuf[:rawLen]
+	// Reuse c.txEncBuf for SRTP-encrypted output. EncryptRTP appends
+	// to the provided dst (plaintext + 10-byte HMAC-SHA1-80 tag for
+	// our profile), so sizing once to rawLen+16 keeps the encryption
+	// alloc-free in steady state.
+	encSize := rawLen + 16
+	if cap(c.txEncBuf) < encSize {
+		c.txEncBuf = make([]byte, 0, encSize+64)
+	}
+	enc, err := c.encCtx.EncryptRTP(c.txEncBuf[:0], raw, nil)
 	if err != nil {
 		return 0, fmt.Errorf("srtp encrypt: %w", err)
 	}
+	c.txEncBuf = enc[:0]
 	if _, err := c.underlay.WriteTo(enc, c.remote); err != nil {
 		return 0, err
 	}
