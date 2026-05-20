@@ -477,6 +477,18 @@ func (p *Proxy) Start() error {
 	// calling sleep()/wake() which is unreliable.
 	go p.runWatchdog()
 
+	// Diagnostic heartbeat — fires every 5s for the first 2 minutes after
+	// proxy.Start. Logs goroutine count + RSS + per-channel pending depth
+	// so that we can see, in the iOS log AFTER an extension-kill event,
+	// exactly when the process stopped responding (the last heartbeat
+	// timestamp). Without this, multi-second log gaps before iOS kills
+	// the extension look identical regardless of whether the process
+	// hung 30 seconds ago or 1 second ago.
+	//
+	// Time-bounded so a long-lived production session doesn't accumulate
+	// thousands of heartbeat lines. Investigating build-119 38s-death.
+	go p.runDiagnosticHeartbeat(p.ctx, 2*time.Minute, 5*time.Second)
+
 	// Background cred-pool grower: fills empty slots over time without
 	// blocking conn startup. Conn 0 still does an inline fetch (needs at
 	// least one cred to bootstrap). Conns 1-N use fallback to whichever
@@ -1177,6 +1189,48 @@ func (p *Proxy) wakeChannel() <-chan struct{} {
 //   - Captcha-triggered slow ramp-up commonly leaves us at "10/30 active
 //     for 5+ min" while VK rate-limits PoW for our IP. Forcing reconnect
 //     in that state killed 10 working conns and didn't help unstick VK.
+// runDiagnosticHeartbeat fires a single-line log every `interval` for up
+// to `window` total duration. Purpose: confirm the extension process is
+// still alive at known timestamps when otherwise quiet (post-cold-start
+// SRTP MVP runs with no per-packet logging). If the heartbeats stop at
+// T+33s while NEVPNStatus → 1 fires at T+38s, we know the Go runtime
+// hung at T+33s — vs if the heartbeat continues up to T+37s, the Go
+// runtime was fine and iOS killed it externally.
+//
+// Logs RSS + goroutine count + sendCh/recvCh depths so we also see if
+// any bridge channel filled up before the death.
+func (p *Proxy) runDiagnosticHeartbeat(ctx context.Context, window, interval time.Duration) {
+	deadline := time.Now().Add(window)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if time.Now().After(deadline) {
+				log.Printf("proxy: heartbeat window expired — stopping diagnostic")
+				return
+			}
+			var ms runtime.MemStats
+			runtime.ReadMemStats(&ms)
+			rss := "n/a"
+			if PhysFootprintFn != nil {
+				rss = fmt.Sprintf("%.1fMB", float64(PhysFootprintFn())/1024/1024)
+			}
+			log.Printf("proxy: HEARTBEAT t+%s rss=%s sys=%.1fMB goroutines=%d active-conns=%d sendCh=%d/%d recvCh=%d/%d tx=%d rx=%d",
+				time.Since(p.startedAt).Round(time.Second),
+				rss,
+				float64(ms.Sys)/1024/1024,
+				runtime.NumGoroutine(),
+				p.activeConns.Load(),
+				len(p.sendCh), cap(p.sendCh),
+				len(p.recvCh), cap(p.recvCh),
+				p.txBytes.Load(), p.rxBytes.Load())
+		}
+	}
+}
+
 func (p *Proxy) runWatchdog() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -3787,6 +3841,46 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 
 	if connIdx >= 0 && connIdx < len(p.lastPongTimes) {
 		p.lastPongTimes[connIdx].Store(time.Now().Unix())
+	}
+
+	// NAT keepalive — mirror the runDTLSSession behaviour from
+	// proxy.go:2693. Send a STUN Binding request every 25s on the
+	// underlying TCP-control conn to the TURN relay. Two reasons this
+	// is critical even more on the SRTP path than the DTLS path:
+	//
+	//  1. iOS treats the TURN relay as the single exempt host under
+	//     includeAllNetworks=true. Multiple silent TCP-control sockets
+	//     to that host appear to count against an iOS Network Extension
+	//     stability check that fires somewhere around the 35-40s mark
+	//     after the tunnel connects — build 117/118/119 (SRTP path
+	//     working but no NAT keepalive) consistently saw the extension
+	//     killed externally at ~T+38s without a graceful stopTunnel.
+	//     With STUN Binding every 25s, each TCP socket sees ~28 bytes
+	//     of OUR traffic per cycle even when WG isn't actively sending
+	//     on that conn, keeping the socket visibly alive.
+	//
+	//  2. Standard RFC 5766 reason — refreshes NAT mapping on routers
+	//     between the iPhone and the relay during silent periods (e.g.
+	//     during iOS sleep). Less critical for TCP than UDP, but free
+	//     defence in depth.
+	//
+	// Type-assert to access the underlying *turn.Client. setupSRTPSession
+	// always returns a *srtpSessionConn so the assertion will succeed
+	// for the production path; the if-ok guard is defence against any
+	// future test mock that might return a bare net.Conn.
+	if sess, ok := srtpConn.(*srtpSessionConn); ok && sess.tc != nil {
+		go func() {
+			ticker := time.NewTicker(25 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					_, _ = sess.tc.SendBindingRequest()
+				case <-connCtx.Done():
+					return
+				}
+			}
+		}()
 	}
 
 	var wg sync.WaitGroup
