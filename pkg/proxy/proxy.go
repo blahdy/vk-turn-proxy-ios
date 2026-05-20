@@ -3883,6 +3883,134 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 		}()
 	}
 
+	// Liveness-probe sender — ported from runDTLSSession (proxy.go:2084+).
+	// Sends a 12-byte ping (0xff PNG + 8-byte BE seq) every probeInterval
+	// over the SRTP-wrapped pipe. Server with probe-echo support echoes
+	// it back; the recv goroutine recognises the magic, updates
+	// lastPongTimes[connIdx] and bumps serverProbeable. After
+	// serverProbeable=true, periodic zombie check fires connCancel() if
+	// no pong arrives within probeStaleThreshold. Without server-side
+	// echo support serverProbeable stays false and the zombie/active-
+	// probe gates never fire — fully backward-compatible with the
+	// pre-probe-echo SRTP server.
+	//
+	// Mirrors the DTLS path's tick-gap freeze detector and wakeCh-driven
+	// active-probe-on-wake. Mostly verbatim from runDTLSSession; the
+	// only structural difference is writing through srtpConn instead of
+	// dtlsConn.
+	go func() {
+		ticker := time.NewTicker(probeInterval)
+		defer ticker.Stop()
+		var seq uint64
+		pingPkt := make([]byte, len(probePingMagic)+8)
+		copy(pingPkt[0:len(probePingMagic)], probePingMagic)
+		lastTickAt := time.Now()
+		for {
+			wakeCh := p.wakeChannel()
+			select {
+			case <-ticker.C:
+				now := time.Now()
+				gap := now.Sub(lastTickAt)
+				if gap > 90*time.Second {
+					log.Printf("proxy: [conn %d] SRTP probe tick gap %s (freeze detected), resetting pong clock",
+						connIdx, gap.Round(time.Second))
+					if connIdx >= 0 && connIdx < len(p.lastPongTimes) {
+						p.lastPongTimes[connIdx].Store(now.Unix())
+					}
+					lastTickAt = now
+					continue
+				}
+				lastTickAt = now
+				seq++
+				binary.BigEndian.PutUint64(pingPkt[len(probePingMagic):], seq)
+				_ = srtpConn.SetWriteDeadline(now.Add(5 * time.Second))
+				if _, err := srtpConn.Write(pingPkt); err != nil {
+					return
+				}
+				if connIdx >= 0 && connIdx < len(p.lastPingSeq) {
+					p.lastPingSeq[connIdx].Store(seq)
+					p.firstPingAt[connIdx].CompareAndSwap(0, now.Unix())
+				}
+				if p.serverProbeable.Load() && connIdx >= 0 && connIdx < len(p.lastPongTimes) {
+					lastPong := time.Unix(p.lastPongTimes[connIdx].Load(), 0)
+					stale := time.Since(lastPong)
+					if stale > probeStaleThreshold {
+						lastPing := p.lastPingSeq[connIdx].Load()
+						lastPongS := p.lastPongSeq[connIdx].Load()
+						var sentSinceLastPong uint64
+						if lastPing >= lastPongS {
+							sentSinceLastPong = lastPing - lastPongS
+						}
+						firstPong := p.firstPongAt[connIdx].Load()
+						pongHistory := "never"
+						if firstPong > 0 {
+							pongHistory = time.Since(time.Unix(firstPong, 0)).Round(time.Second).String() + " ago (first pong)"
+						}
+						authCount := p.credPool.authErrorCount(credSlot)
+						log.Printf("proxy: [conn %d on slot %d] SRTP zombie detected (no pong for %s, lastPingSeq=%d lastPongSeq=%d sentSinceLastPong=%d firstPong=%s, authErrorsOnSlot=%d), killing",
+							connIdx, credSlot, stale.Round(time.Second), lastPing, lastPongS, sentSinceLastPong, pongHistory, authCount)
+						connCancel()
+						return
+					}
+				}
+			case <-wakeCh:
+				if !p.serverProbeable.Load() {
+					continue
+				}
+				if connIdx < 0 || connIdx >= len(p.lastActiveProbeAt) {
+					continue
+				}
+				lastProbe := p.lastActiveProbeAt[connIdx].Load()
+				if lastProbe > 0 && time.Since(time.Unix(lastProbe, 0)) < 30*time.Second {
+					continue
+				}
+				now := time.Now()
+				p.lastActiveProbeAt[connIdx].Store(now.Unix())
+				seq++
+				binary.BigEndian.PutUint64(pingPkt[len(probePingMagic):], seq)
+				_ = srtpConn.SetWriteDeadline(now.Add(5 * time.Second))
+				if _, err := srtpConn.Write(pingPkt); err != nil {
+					return
+				}
+				p.lastPingSeq[connIdx].Store(seq)
+				p.firstPingAt[connIdx].CompareAndSwap(0, now.Unix())
+				sentSeq := seq
+				probeStart := time.Now()
+				deadline := probeStart.Add(30 * time.Second)
+				echoed := false
+				for time.Now().Before(deadline) {
+					if p.lastPongSeq[connIdx].Load() >= sentSeq {
+						echoed = true
+						break
+					}
+					select {
+					case <-time.After(100 * time.Millisecond):
+					case <-connCtx.Done():
+						return
+					}
+				}
+				if !echoed {
+					lastPongS := p.lastPongSeq[connIdx].Load()
+					authCount := p.credPool.authErrorCount(credSlot)
+					var sentSinceLastPong uint64
+					if sentSeq >= lastPongS {
+						sentSinceLastPong = sentSeq - lastPongS
+					}
+					log.Printf("proxy: [conn %d on slot %d] SRTP active probe (post-wake) no echo within 30s (sentSeq=%d lastPongSeq=%d sentSinceLastPong=%d authErrorsOnSlot=%d), killing",
+						connIdx, credSlot, sentSeq, lastPongS, sentSinceLastPong, authCount)
+					connCancel()
+					return
+				}
+				rtt := time.Since(probeStart).Round(10 * time.Millisecond)
+				log.Printf("proxy: [conn %d] SRTP active probe (post-wake) echo received in %s (sentSeq=%d)",
+					connIdx, rtt, sentSeq)
+				lastTickAt = time.Now()
+			case <-connCtx.Done():
+				return
+			}
+		}
+	}()
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 
@@ -3958,12 +4086,38 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 
 			// Probe pong recognition: drop ping-echo packets so WG never
 			// sees the 0xff... magic bytes (it would treat them as
-			// invalid message type). Same probePingMagic detection as
-			// runDTLSSession recv path.
+			// invalid message type). Ported from runDTLSSession recv
+			// path (proxy.go:2434+) — same seq tracking + first-pong
+			// log + pong-gap log so the SRTP zombie / active-probe
+			// machinery has identical observability to DTLS.
 			if isProbePacket(buf[:n]) {
 				p.serverProbeable.Store(true)
 				if connIdx >= 0 && connIdx < len(p.lastPongTimes) {
-					p.lastPongTimes[connIdx].Store(time.Now().Unix())
+					now := time.Now()
+					nowUnix := now.Unix()
+					prevPongAt := p.lastPongTimes[connIdx].Load()
+					prevPongSeq := p.lastPongSeq[connIdx].Load()
+					p.lastPongTimes[connIdx].Store(nowUnix)
+					var pongSeq uint64
+					if n >= len(probePingMagic)+8 {
+						pongSeq = binary.BigEndian.Uint64(buf[len(probePingMagic) : len(probePingMagic)+8])
+						p.lastPongSeq[connIdx].Store(pongSeq)
+					}
+					if p.firstPongAt[connIdx].CompareAndSwap(0, nowUnix) {
+						firstPing := p.firstPingAt[connIdx].Load()
+						bootstrap := "?"
+						if firstPing > 0 {
+							bootstrap = time.Since(time.Unix(firstPing, 0)).Round(100 * time.Millisecond).String()
+						}
+						log.Printf("proxy: [conn %d] SRTP first pong received (seq=%d, %s after first ping)",
+							connIdx, pongSeq, bootstrap)
+					} else if prevPongAt > 0 {
+						gap := nowUnix - prevPongAt
+						if gap > 300 {
+							log.Printf("proxy: [conn %d] SRTP pong gap %ds resolved (prev pongSeq=%d, this pongSeq=%d, missed=%d)",
+								connIdx, gap, prevPongSeq, pongSeq, pongSeq-prevPongSeq-1)
+						}
+					}
 				}
 				continue
 			}
