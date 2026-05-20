@@ -129,11 +129,18 @@ type ProxyConfig struct {
 	// (see proxy.Config.UseWrap and pkg/proxy/wrap.go). Requires the
 	// peer server to be running cacggghp/vk-turn-proxy with matching
 	// -wrap and -wrap-key flags (the upstream WRAP-aware build).
+	//
+	// NOTE 2026-05-20: WRAP no longer escapes VK's content classifier;
+	// new code should set UseSrtp instead (see proxy.Config.UseSrtp).
 	UseWrap             bool              `json:"use_wrap"`
 	// WrapKeyHex is the 64-character hex encoding of the 32-byte
 	// ChaCha20 shared key. Required when UseWrap is true and must
 	// match the server's -wrap-key value exactly.
 	WrapKeyHex          string            `json:"wrap_key_hex"`
+	// UseSrtp enables the DTLS+SRTP transport (see pkg/proxy/srtpwrap
+	// and proxy.Config.UseSrtp). Requires the peer server to be running
+	// anton48/vk-turn-proxy add-server-srtp-layer with the -srtp flag.
+	UseSrtp             bool              `json:"use_srtp"`
 	NumConns                int `json:"num_conns,omitempty"`
 	CredPoolCooldownSeconds int `json:"cred_pool_cooldown_seconds,omitempty"`
 	// VKHostIPs is a hostname→[]IP map pre-resolved by the main app
@@ -200,6 +207,7 @@ func wgTurnOnWithTURN(settings *C.char, tunFd C.int32_t, proxyConfigJSON *C.char
 		UseUDP:           pcfg.UseUDP,
 		UseWrap:          pcfg.UseWrap,
 		WrapKey:          wrapKey,
+		UseSrtp:          pcfg.UseSrtp,
 		NumConns:         pcfg.NumConns,
 		CredPoolCooldown: time.Duration(pcfg.CredPoolCooldownSeconds) * time.Second,
 	})
@@ -334,6 +342,7 @@ func wgStartVKBootstrap(proxyConfigJSON *C.char) C.int32_t {
 		UseUDP:           pcfg.UseUDP,
 		UseWrap:          pcfg.UseWrap,
 		WrapKey:          wrapKey,
+		UseSrtp:          pcfg.UseSrtp,
 		NumConns:         pcfg.NumConns,
 		CredPoolCooldown: time.Duration(pcfg.CredPoolCooldownSeconds) * time.Second,
 		SeededTURN:       seededTURN,

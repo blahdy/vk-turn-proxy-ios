@@ -26,6 +26,8 @@ import (
 	"github.com/pion/dtls/v3/pkg/crypto/selfsign"
 	"github.com/pion/logging"
 	"github.com/pion/turn/v5"
+
+	"github.com/cacggghp/vk-turn-proxy/pkg/proxy/srtpwrap"
 )
 
 // Config holds proxy configuration.
@@ -61,11 +63,38 @@ type Config struct {
 	// from the upstream cacggghp/vk-turn-proxy WRAP-aware build —
 	// without that, the DTLS handshake fails because the server-side
 	// raw bytes get XOR'd by VK-relay-clean-but-WRAP-confused server.
+	//
+	// NOTE 2026-05-20: WRAP no longer escapes VK's content classifier
+	// (see srtp_breakthrough_2026_05_19 memory file). The replacement
+	// is UseSrtp below, which falls into VK's "recognised media" bucket
+	// and bypasses the per-allocation shape policy entirely. WRAP
+	// config fields are kept for backward-compat with existing backups
+	// but produce inferior throughput on current VK relays.
 	UseWrap bool
 	// WrapKey is the 32-byte ChaCha20 shared key, identical on client
 	// and server, required when UseWrap is true. Wrong/short keys are
 	// caught at proxy startup so the operator gets a clear error.
 	WrapKey []byte
+
+	// UseSrtp enables the DTLS+SRTP transport (see pkg/proxy/srtpwrap).
+	// When true, the proxy bypasses the existing DTLS+WireGuard path
+	// entirely and uses srtpwrap.Client to wrap user traffic as
+	// RTP-framed packets encrypted with SRTP, sent through the TURN
+	// relay's ChannelData. VK's TURN classifier sees this as legitimate
+	// WebRTC media and does not apply the per-allocation shape policy
+	// that throttles raw DTLS+WG to ~9 KB/s.
+	//
+	// Server side must run with the matching -srtp flag (anton48/
+	// vk-turn-proxy add-server-srtp-layer branch, deployed on a
+	// separate port from the legacy DTLS listener — typically :56004).
+	// When UseSrtp is true the client MUST point at the SRTP-mode
+	// server port; pointing at a non-SRTP server produces a clean
+	// handshake failure.
+	//
+	// Empirical 2026-05-19/20: sustained 200+ KB/s per conn, 0 % loss,
+	// linear scaling across creds — 30-conn production layout delivers
+	// ~50 Mbps total (vs ~2 Mbps for the DTLS+WG baseline shape).
+	UseSrtp bool
 }
 
 // Stats holds live tunnel statistics.
@@ -1605,9 +1634,12 @@ func (p *Proxy) runConnection(sessCtx context.Context, linkID string, readyCh ch
 
 		start := time.Now()
 		var err error
-		if p.config.UseDTLS {
+		switch {
+		case p.config.UseSrtp:
+			err = p.runSRTPSession(sessCtx, linkID, readyCh, &signaled, connIdx)
+		case p.config.UseDTLS:
 			err = p.runDTLSSession(sessCtx, linkID, readyCh, &signaled, connIdx)
-		} else {
+		default:
 			err = p.runDirectSession(sessCtx, linkID, readyCh, &signaled, connIdx)
 		}
 		if err != nil {
@@ -3686,3 +3718,273 @@ func (p *Proxy) probeForShapingDTLS(
 		actualRateBps/1024)
 	return nil
 }
+
+// ─── SRTP transport (Config.UseSrtp=true) ─────────────────────────────────
+//
+// runSRTPSession is the third dispatch target alongside runDTLSSession and
+// runDirectSession (selected via Config.UseSrtp in runConnection). Tunnel
+// traffic is framed as DTLS+SRTP+RTP and sent through the TURN relay's
+// ChannelData; VK's content classifier sees this as legitimate WebRTC
+// media and does NOT apply the per-allocation shape policy. Server-side
+// counterpart is anton48/vk-turn-proxy add-server-srtp-layer branch on
+// port :56004.
+//
+// MVP NOTE: this first integration is intentionally simpler than
+// runDTLSSession — it omits the probe sender / zombie watchdog / shape-
+// probe / iOS-freeze-handling logic that runDTLSSession accumulated over
+// months. Those stability features can be ported incrementally once the
+// basic SRTP path is empirically validated end-to-end on the iOS app. The
+// toggle Config.UseSrtp defaults to false so users on the standard build
+// retain the existing DTLS+WG transport unchanged.
+func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh chan<- struct{}, signaled *bool, connIdx int) error {
+	_ = linkID // reserved for future per-link logging parity with DTLS path
+	connCtx, connCancel := context.WithCancel(sessCtx)
+	defer connCancel()
+
+	// Acquire cred — same pattern as runDTLSSession / runDirectSession.
+	turnAddr, creds, credSlot, err := p.resolveTURNAddr(connIdx, false)
+	if err != nil {
+		return err
+	}
+	currentSlot := credSlot
+	defer func() { p.credPool.release(currentSlot) }()
+
+	// Set up TURN allocation and DTLS-SRTP handshake to the peer.
+	sessStart := time.Now()
+	srtpConn, err := p.setupSRTPSession(connCtx, turnAddr, creds, credSlot, connIdx)
+	if err != nil {
+		// Mirror runDTLSSession's error attribution so quota / auth
+		// failures land on the correct slot.
+		if isQuotaError(err) {
+			cooldown := p.credPool.markSaturated(credSlot)
+			log.Printf("proxy: [conn %d] SRTP TURN allocate quota error (486) on slot %d (cooldown %s)",
+				connIdx, credSlot, cooldown.Round(time.Second))
+		} else if isAuthError(err) {
+			p.credPool.invalidateEntry(credSlot)
+			log.Printf("proxy: [conn %d] SRTP bootstrap auth error on slot %d, invalidated",
+				connIdx, credSlot)
+		}
+		return fmt.Errorf("SRTP setup: %w", err)
+	}
+	defer srtpConn.Close()
+	context.AfterFunc(connCtx, func() { _ = srtpConn.Close() })
+
+	p.dtlsHSns.Store(int64(time.Since(sessStart)))
+	p.activeConns.Add(1)
+	p.totalConns.Add(1)
+	defer p.activeConns.Add(-1)
+
+	if readyCh != nil && !*signaled {
+		select {
+		case readyCh <- struct{}{}:
+		default:
+		}
+	}
+	*signaled = true
+	p.signalBootstrapDone(nil)
+
+	log.Printf("proxy: [conn %d, cred %d] SRTP+TURN session established", connIdx, credSlot)
+
+	if connIdx >= 0 && connIdx < len(p.lastPongTimes) {
+		p.lastPongTimes[connIdx].Store(time.Now().Unix())
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Send: sendCh → srtpConn.
+	go func() {
+		defer wg.Done()
+		defer connCancel()
+		for {
+			select {
+			case <-connCtx.Done():
+				log.Printf("proxy: [conn %d] SRTP send goroutine: ctx cancelled", connIdx)
+				return
+			case pkt := <-p.sendCh:
+				_ = srtpConn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+				if _, err := srtpConn.Write(pkt); err != nil {
+					log.Printf("proxy: [conn %d] SRTP send error: %v", connIdx, err)
+					return
+				}
+			}
+		}
+	}()
+
+	// Recv: srtpConn → recvCh, dropping any probe pongs.
+	go func() {
+		defer wg.Done()
+		defer connCancel()
+		buf := make([]byte, 1600)
+		for {
+			deadlineSetAt := time.Now()
+			_ = srtpConn.SetReadDeadline(deadlineSetAt.Add(30 * time.Second))
+			n, err := srtpConn.Read(buf)
+			if err != nil {
+				if connCtx.Err() != nil {
+					log.Printf("proxy: [conn %d] SRTP recv goroutine: ctx cancelled (err=%v)", connIdx, err)
+					return
+				}
+				if strings.Contains(err.Error(), "timeout") || strings.Contains(err.Error(), "deadline exceeded") {
+					// Same iOS-freeze + global-tunnel-health pattern as
+					// runDTLSSession recv goroutine.
+					elapsed := time.Since(deadlineSetAt)
+					if elapsed > 90*time.Second {
+						log.Printf("proxy: [conn %d] SRTP read elapsed %s (freeze detected), resetting lastRecvTime",
+							connIdx, elapsed.Round(time.Second))
+						p.lastRecvTime.Store(time.Now().Unix())
+						continue
+					}
+					lastRecv := p.lastRecvTime.Load()
+					if lastRecv > 0 && time.Since(time.Unix(lastRecv, 0)) < 3*time.Minute {
+						continue
+					}
+					staleFor := "unknown"
+					if lastRecv > 0 {
+						staleFor = time.Since(time.Unix(lastRecv, 0)).Round(time.Second).String()
+					}
+					log.Printf("proxy: [conn %d] SRTP read timeout, tunnel stale (last recv %s ago), reconnecting", connIdx, staleFor)
+					return
+				}
+				log.Printf("proxy: [conn %d] SRTP read error: %v", connIdx, err)
+				return
+			}
+			p.lastRecvTime.Store(time.Now().Unix())
+
+			// Probe pong recognition: drop ping-echo packets so WG never
+			// sees the 0xff... magic bytes (it would treat them as
+			// invalid message type). Same probePingMagic detection as
+			// runDTLSSession recv path.
+			if isProbePacket(buf[:n]) {
+				p.serverProbeable.Store(true)
+				if connIdx >= 0 && connIdx < len(p.lastPongTimes) {
+					p.lastPongTimes[connIdx].Store(time.Now().Unix())
+				}
+				continue
+			}
+
+			pkt := make([]byte, n)
+			copy(pkt, buf[:n])
+			select {
+			case p.recvCh <- pkt:
+			case <-connCtx.Done():
+				log.Printf("proxy: [conn %d] SRTP recv goroutine: ctx cancelled during recvCh send", connIdx)
+				return
+			}
+		}
+	}()
+
+	wg.Wait()
+	return nil
+}
+
+// setupSRTPSession opens a TURN client (UDP or TCP control transport
+// based on p.config.UseUDP), allocates a relay, creates a permission
+// for p.peer, and performs the DTLS+SRTP handshake. Returns a net.Conn
+// (srtpSessionConn wrapper) whose Read/Write framing is RTP+SRTP and
+// whose Close tears down the SRTP wrapper, the relay allocation, the
+// TURN client, and the underlying control conn together.
+func (p *Proxy) setupSRTPSession(ctx context.Context, turnAddr string, creds *TURNCreds, credSlot, connIdx int) (net.Conn, error) {
+	// Local control conn: UDP socket (UDP-control) or TCP dial wrapped
+	// in turn.NewSTUNConn (TCP-control). Mirrors tools/turn_srtp_test
+	// transport plumbing.
+	var ctlConn net.PacketConn
+	if p.config.UseUDP {
+		uc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+		if err != nil {
+			return nil, fmt.Errorf("local udp listen: %w", err)
+		}
+		ctlConn = uc
+	} else {
+		dialer := net.Dialer{Timeout: 5 * time.Second}
+		tcp, err := dialer.Dial("tcp", turnAddr)
+		if err != nil {
+			return nil, fmt.Errorf("dial tcp to relay: %w", err)
+		}
+		ctlConn = turn.NewSTUNConn(tcp)
+	}
+
+	tc, err := turn.NewClient(&turn.ClientConfig{
+		TURNServerAddr:         turnAddr,
+		Conn:                   ctlConn,
+		Username:               creds.Username,
+		Password:               creds.Password,
+		Realm:                  "okcdn.ru",
+		Software:               "vk-turn-srtp",
+		LoggerFactory:          logging.NewDefaultLoggerFactory(),
+		RequestedAddressFamily: turn.RequestedAddressFamilyIPv4,
+	})
+	if err != nil {
+		_ = ctlConn.Close()
+		return nil, fmt.Errorf("turn.NewClient: %w", err)
+	}
+	if err := tc.Listen(); err != nil {
+		tc.Close()
+		_ = ctlConn.Close()
+		return nil, fmt.Errorf("turn listen: %w", err)
+	}
+
+	allocStart := time.Now()
+	relayConn, err := tc.Allocate()
+	if err != nil {
+		tc.Close()
+		_ = ctlConn.Close()
+		return nil, fmt.Errorf("turn allocate: %w", err)
+	}
+	allocDur := time.Since(allocStart)
+	if err := tc.CreatePermission(p.peer); err != nil {
+		_ = relayConn.Close()
+		tc.Close()
+		_ = ctlConn.Close()
+		return nil, fmt.Errorf("turn create permission: %w", err)
+	}
+	log.Printf("proxy: [conn %d] TURN relay allocated: %s (RTT %dms, local=%s)",
+		connIdx, relayConn.LocalAddr(), allocDur.Milliseconds(), ctlConn.LocalAddr())
+
+	hsCtx, hsCancel := context.WithTimeout(ctx, srtpwrap.HandshakeTimeout)
+	srtpConn, err := srtpwrap.Client(hsCtx, relayConn, p.peer)
+	hsCancel()
+	if err != nil {
+		_ = relayConn.Close()
+		tc.Close()
+		_ = ctlConn.Close()
+		return nil, fmt.Errorf("srtp handshake: %w", err)
+	}
+
+	return &srtpSessionConn{
+		Conn:      srtpConn,
+		relayConn: relayConn,
+		tc:        tc,
+		ctlConn:   ctlConn,
+	}, nil
+}
+
+// srtpSessionConn ties the SRTP-wrapped net.Conn returned by srtpwrap.
+// Client to the underlying TURN allocation and control conn so a single
+// Close() tears down the whole stack.
+type srtpSessionConn struct {
+	net.Conn // SRTP-wrapped conn
+	relayConn net.PacketConn
+	tc        *turn.Client
+	ctlConn   net.PacketConn
+
+	closeOnce sync.Once
+}
+
+func (s *srtpSessionConn) Close() error {
+	var firstErr error
+	s.closeOnce.Do(func() {
+		if err := s.Conn.Close(); err != nil {
+			firstErr = err
+		}
+		if err := s.relayConn.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		s.tc.Close()
+		if err := s.ctlConn.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	})
+	return firstErr
+}
+
