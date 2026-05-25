@@ -2260,6 +2260,19 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 				if lastProbe > 0 && time.Since(time.Unix(lastProbe, 0)) < 30*time.Second {
 					continue
 				}
+				// Stagger active-probe firing across the conn pool — see
+				// matching change in runSRTPSession wake-probe handler for
+				// the full rationale. Same pattern, same risk (transient
+				// allocation peak from simultaneous fire-all-conns probe
+				// burst), defensive fix even though current production
+				// uses SRTP path by default.
+				if jitterNs := mathrand.Int63n(int64(300 * time.Millisecond)); jitterNs > 0 {
+					select {
+					case <-time.After(time.Duration(jitterNs)):
+					case <-connCtx.Done():
+						return
+					}
+				}
 				now := time.Now()
 				p.lastActiveProbeAt[connIdx].Store(now.Unix())
 
@@ -4021,6 +4034,26 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 				lastProbe := p.lastActiveProbeAt[connIdx].Load()
 				if lastProbe > 0 && time.Since(time.Unix(lastProbe, 0)) < 30*time.Second {
 					continue
+				}
+				// Stagger active-probe firing across the conn pool to spread
+				// the post-wake allocation/CPU/probe-Write burst over time.
+				// Without jitter all 30 conns wake() handlers fire
+				// simultaneously and finish their probe Write+SRTP-encrypt
+				// within ~290ms (observed 2026-05-25 16:27:47 in
+				// vpn.wifi-lte-wifi.2.log of 25.05.2026 just before the
+				// 16:27:50 jetsam kill — the burst landed on already-elevated
+				// heap from preceding traffic + vkcalls bootstrap and pushed
+				// transient phys_footprint over the iOS NE per-process limit).
+				// Jittered 0-300ms sleep per-conn flattens the burst so GC
+				// can interleave between probe pulses. Worst-case freeze-
+				// detection latency increases by 300ms, which is negligible
+				// vs the 30s probe timeout.
+				if jitterNs := mathrand.Int63n(int64(300 * time.Millisecond)); jitterNs > 0 {
+					select {
+					case <-time.After(time.Duration(jitterNs)):
+					case <-connCtx.Done():
+						return
+					}
 				}
 				now := time.Now()
 				p.lastActiveProbeAt[connIdx].Store(now.Unix())
