@@ -47,6 +47,7 @@ import (
 	"io"
 	"log"
 	neturl "net/url"
+	"os"
 	"strings"
 
 	fhttp "github.com/bogdanfinn/fhttp"
@@ -73,6 +74,14 @@ const (
 // unexpectedly appears (caller should fall back to legacy path then).
 // Returns generic error on any other failure (caller can also try legacy).
 func getVKCredsViaVKCallsPath(linkID string) (*TURNCreds, error) {
+	// Diagnostic escape hatch (standalone tools/captcha_test only): when
+	// VK_SKIP_VKCALLS=1 is set, skip the captcha-free path entirely so
+	// GetVKCreds falls through to the legacy captchaNotRobot.* solver —
+	// lets the Mac test always exercise a real captcha and observe what VK
+	// serves (slider vs checkbox). Unset in production iOS → no effect.
+	if os.Getenv("VK_SKIP_VKCALLS") == "1" {
+		return nil, fmt.Errorf("vkcalls skipped (VK_SKIP_VKCALLS=1)")
+	}
 	deviceID := uuid.New().String()
 	name := generateName()
 	ua := GetSessionUserAgent()

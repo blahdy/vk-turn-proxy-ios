@@ -223,6 +223,23 @@ func GetVKCreds(linkID string, captchaSolver CaptchaSolver, solvedCaptchaSID, so
 			// Shuffle the list so each connection attempt uses a different order.
 			creds = make([]vkCredentials, len(vkCredentialsList))
 			copy(creds, vkCredentialsList)
+			// DIAGNOSTIC (standalone tools/captcha_test only): replace the
+			// whole credential list with VK_TEST_CREDS="id:secret,id:secret"
+			// to probe whether a different client_id/secret (e.g. another
+			// fork's) changes VK's captcha type/verdict. Unset in production.
+			if tc := os.Getenv("VK_TEST_CREDS"); tc != "" {
+				var override []vkCredentials
+				for _, pair := range strings.Split(tc, ",") {
+					kv := strings.SplitN(strings.TrimSpace(pair), ":", 2)
+					if len(kv) == 2 && kv[0] != "" && kv[1] != "" {
+						override = append(override, vkCredentials{ClientID: kv[0], ClientSecret: kv[1]})
+					}
+				}
+				if len(override) > 0 {
+					creds = override
+					log.Printf("vk: VK_TEST_CREDS override active — %d custom client_id(s)", len(override))
+				}
+			}
 			// DIAGNOSTIC (2026-05-17 api.vk.me test): filter to one specific
 			// client_id if VK_CLIENT_ID_ONLY env var is set. Used to isolate
 			// which client_id is captcha-gated on api.vk.me. Remove after

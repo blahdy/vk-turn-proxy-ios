@@ -44,8 +44,17 @@ import (
 func main() {
 	vkLink := flag.String("vk-link", "", "VK call link, e.g. https://vk.ru/call/join/<linkID>")
 	profilePath := flag.String("vk-profile", "", "path to vk_profile.json OR a vkturnproxy-backup-*.json (auto-detect)")
-	timeout := flag.Duration("timeout", 90*time.Second, "overall timeout")
+	timeout := flag.Duration("timeout", 90*time.Second, "per-attempt timeout")
+	loops := flag.Int("loops", 1, "how many captcha attempts to run in sequence")
+	interval := flag.Duration("interval", 3*time.Minute, "delay between attempts (VK per-IP captcha cooldown is ~30min — keep generous)")
+	freePath := flag.Bool("free-path", false, "allow the VK Calls captcha-free path (default: skip it so every attempt hits a real captcha)")
+	desktopChrome := flag.Bool("desktop-chrome", false, "DIAGNOSTIC: present a fully-consistent DESKTOP CHROME 146 identity (TLS Chrome_146 + desktop UA + sec-ch-ua + 1920x1080 device + random browser_fp) instead of the production iPhone Safari; a captured --vk-profile is IGNORED in this mode. (Production default = Safari identity + Safari header-order fix.)")
 	flag.Parse()
+
+	if *desktopChrome {
+		os.Setenv("VK_DESKTOP_CHROME", "1")
+		log.Printf("test: --desktop-chrome — captcha session presents DESKTOP CHROME 146 (NOT iPhone Safari); any captured --vk-profile fp/device/UA will be IGNORED")
+	}
 
 	if *vkLink == "" {
 		log.Fatal("--vk-link is required (e.g. https://vk.ru/call/join/<linkID>)")
@@ -57,6 +66,13 @@ func main() {
 	}
 	log.Printf("test: linkID=%s", linkID)
 
+	if !*freePath {
+		os.Setenv("VK_SKIP_VKCALLS", "1")
+		log.Printf("test: VK Calls captcha-free path DISABLED — forcing the legacy captchaNotRobot.* path so every attempt hits a real captcha")
+	} else {
+		log.Printf("test: --free-path set — VK Calls path enabled (may succeed without captcha)")
+	}
+
 	if *profilePath != "" {
 		if err := loadProfileFromPath(*profilePath); err != nil {
 			log.Fatalf("load --vk-profile: %v", err)
@@ -65,50 +81,63 @@ func main() {
 		log.Printf("test: no --vk-profile flag — solver will use generated fp+device (almost certainly BOT)")
 	}
 
-	log.Printf("test: starting GetVKCreds (full bootstrap + Go captcha solver, no WebView fallback)")
-	log.Printf("test: this calls login.vk.ru/?act=get_anonym_token → api.vk.ru/method/calls.getAnonymousToken")
-	log.Printf("test: on captcha demand, solveCaptchaPoW runs (Phase 11.1 with all preflight calls)")
+	log.Printf("test: each attempt = full legacy bootstrap (login.vk.ru → calls.getAnonymousToken) → on captcha demand, Go solver runs checkbox PoW + slider")
 
-	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	var nSuccess, nCaptcha, nErr int
+	for i := 1; i <= *loops; i++ {
+		log.Printf("════════════════ attempt %d/%d ════════════════", i, *loops)
+		switch runOnce(linkID, *timeout) {
+		case "success":
+			nSuccess++
+		case "captcha":
+			nCaptcha++
+		default:
+			nErr++
+		}
+		if i < *loops {
+			log.Printf("test: sleeping %s before next attempt (VK per-IP captcha cooldown ~30min)", *interval)
+			time.Sleep(*interval)
+		}
+	}
+	log.Printf("════════════════ SUMMARY: %d attempts → %d success, %d captcha/BOT, %d error ════════════════",
+		*loops, nSuccess, nCaptcha, nErr)
+	log.Printf("test: grep the output for 'show_captcha_type', 'slider:' and 'pow:' to see what VK served + how the solver fared each attempt")
+}
+
+// runOnce performs one full GetVKCreds attempt (legacy captcha path forced via
+// VK_SKIP_VKCALLS) and classifies the outcome: "success" (Go solver passed →
+// TURN creds), "captcha" (Go solver did not pass — BOT/rate-limit, the
+// iOS→WebView fallback case), or "error" (bootstrap/network/timeout).
+func runOnce(linkID string, timeout time.Duration) string {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-
-	// Channel to receive result + run GetVKCreds in goroutine so we can
-	// observe ctx timeout cleanly.
 	type result struct {
 		creds *proxy.TURNCreds
 		err   error
 	}
 	resCh := make(chan result, 1)
 	go func() {
-		// nil captchaSolver → on Go-solver failure VK error surfaces as
-		// CaptchaRequiredError; we report it rather than blocking on a
-		// WebView that doesn't exist outside iOS app.
 		creds, err := proxy.GetVKCreds(linkID, nil, "", "", 0, 0, "", "")
 		resCh <- result{creds, err}
 	}()
-
 	select {
 	case <-ctx.Done():
-		log.Fatalf("test: TIMEOUT after %s", *timeout)
+		log.Printf("test: attempt TIMEOUT after %s", timeout)
+		return "error"
 	case r := <-resCh:
 		if r.err != nil {
 			var captchaErr *proxy.CaptchaRequiredError
 			if errors.As(r.err, &captchaErr) {
-				log.Printf("test: RESULT=CAPTCHA_REQUIRED — Go solver failed (likely BOT)")
-				log.Printf("test: captcha_sid=%s, image=%s, isRateLimit=%v",
-					captchaErr.SID, captchaErr.ImageURL, captchaErr.IsRateLimit)
-				log.Printf("test: this is what iOS extension sees → falls back to WebView in production")
-				os.Exit(2)
+				log.Printf("test: RESULT=CAPTCHA — Go solver did NOT pass (sid=%s isRateLimit=%v)",
+					captchaErr.SID, captchaErr.IsRateLimit)
+				return "captcha"
 			}
-			log.Fatalf("test: RESULT=ERROR — bootstrap/network error: %v", r.err)
+			log.Printf("test: RESULT=ERROR — %v", r.err)
+			return "error"
 		}
-		log.Printf("test: RESULT=SUCCESS — got TURN creds!")
-		log.Printf("test:   username=%s", r.creds.Username)
-		log.Printf("test:   password=%s", maskPass(r.creds.Password))
-		log.Printf("test:   address=%s", r.creds.Address)
-		log.Printf("test:   addresses=%v", r.creds.Addresses)
-		log.Printf("test: this means the Go captcha solver WORKS when run outside iOS NetworkExtension")
-		log.Printf("test: implies the BOT response we see on iPhone is iOS-environment-specific")
+		log.Printf("test: RESULT=SUCCESS — TURN creds obtained (user=%s addr=%s) — Go captcha solver WORKED outside iOS NE",
+			r.creds.Username, r.creds.Address)
+		return "success"
 	}
 }
 

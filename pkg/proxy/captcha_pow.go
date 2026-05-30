@@ -124,6 +124,129 @@ func randomHex(n int) string {
 	return hex.EncodeToString(b)
 }
 
+// ── VK_DESKTOP_CHROME diagnostic mode ──────────────────────────────────────
+//
+// When env VK_DESKTOP_CHROME=1 is set, the captcha session presents a
+// FULLY-CONSISTENT DESKTOP CHROME 146 identity instead of the production
+// iPhone-Safari identity. Every axis is flipped together so VK sees one
+// coherent browser:
+//
+//   - TLS:          bogdanfinn profiles.Chrome_146 (real Chrome JA3)
+//   - User-Agent:   Chrome 146 on Windows
+//   - sec-ch-ua*:   Chromium/Google Chrome v146, mobile=?0, platform=Windows
+//   - device blob:  1920x1080 desktop (amurcanov's known-working value)
+//   - browser_fp:   RANDOM (NOT the captured iPhone fp)
+//   - debug_info:   dynamic (unchanged — already version-scraped)
+//
+// Rationale: empirically (2026-05-30, captcha-probe.{mac,msk,www,meg}.log)
+// our iPhone-Safari presentation gets checkbox->BOT + getContent->ERROR on
+// all 4 IPs and even with amurcanov's exact creds, while amurcanov's Android
+// fork — which presents this exact desktop-Chrome identity (profiles.Chrome_146
+// + desktop UA + sec-ch-ua, see go_client/{profiles,captcha_v2}.go) — gets VK
+// to serve a SOLVABLE Go-slider. This mode lets tools/captcha_test reproduce
+// amurcanov's presentation to test whether browser identity is the
+// discriminator. Production iOS (env unset) is unchanged.
+var (
+	desktopChromeOnce sync.Once
+	desktopChromeProf *BrowserProfile
+)
+
+// desktopChromeProfile returns a pinned, process-stable desktop Chrome 146
+// (Windows) profile when VK_DESKTOP_CHROME=1, else nil. Singleton so the TLS
+// client, UA, and sec-ch-ua headers all agree on one identity for the whole
+// process.
+func desktopChromeProfile() *BrowserProfile {
+	desktopChromeOnce.Do(func() {
+		if os.Getenv("VK_DESKTOP_CHROME") != "1" {
+			return
+		}
+		desktopChromeProf = &BrowserProfile{
+			UserAgent:     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+			Platform:      "Windows",
+			ChromeVersion: 146,
+		}
+		log.Printf("pow: VK_DESKTOP_CHROME=1 — captcha session presents DESKTOP CHROME 146 (TLS Chrome_146 + sec-ch-ua + 1920x1080 device + random browser_fp), NOT iPhone Safari")
+	})
+	return desktopChromeProf
+}
+
+// desktopChromeDeviceJSON is the device descriptor sent in componentDone when
+// in desktop-Chrome mode — byte-identical to amurcanov's known-working
+// captchaV2DeviceInfo (go_client/captcha_v2.go:31).
+const desktopChromeDeviceJSON = `{"screenWidth":1920,"screenHeight":1080,"screenAvailWidth":1920,"screenAvailHeight":1080,"innerWidth":1920,"innerHeight":951,"devicePixelRatio":1,"language":"en-US","languages":["en-US","en"],"webdriver":false,"hardwareConcurrency":8,"notificationsPermission":"denied"}`
+
+// chromeCaptchaHeaderOrder is the EXACT HTTP/2 header order amurcanov pins on
+// every captchaNotRobot.* request (go_client/captcha_v2.go captchaV2HeaderOrder).
+// 2026-05-30 A/B proof: this header ORDER is the single discriminator — with it,
+// VK returns checkbox status=OK; without it, status=BOT (Origin .com/.ru and
+// adFp empty/populated are irrelevant). VK fingerprints the header sequence;
+// bogdanfinn's default (uncontrolled) order is what flagged us as BOT for weeks.
+// Set via req.Header[fhttp.HeaderOrderKey]; headers we send that aren't listed
+// (e.g. DNT) trail — same as amurcanov, tolerated by VK.
+var chromeCaptchaHeaderOrder = []string{
+	"host",
+	"content-length",
+	"sec-ch-ua-platform",
+	"accept-language",
+	"sec-ch-ua",
+	"content-type",
+	"sec-ch-ua-mobile",
+	"user-agent",
+	"accept",
+	"origin",
+	"sec-fetch-site",
+	"sec-fetch-mode",
+	"sec-fetch-dest",
+	"referer",
+	"accept-encoding",
+	"priority",
+}
+
+// chromeCaptchaPHeaderOrder is the HTTP/2 pseudo-header order (Chrome).
+var chromeCaptchaPHeaderOrder = []string{":method", ":path", ":authority", ":scheme"}
+
+// safariCaptchaHeaderOrder is the AUTHORITATIVE HTTP/2 header order real Safari
+// WKWebView sends on captchaNotRobot.* POSTs, extracted via mitmdump from the
+// 2026-05-17 capture of our app's WORKING WebView solve (VK accepted it with
+// status=OK). Pinned on EVERY captchaNotRobot.* POST (production default, see
+// vkReq) — this header ORDER was THE captcha discriminator: bogdanfinn's
+// uncontrolled default order didn't match real Safari, so VK flagged us BOT
+// since 2026-05-15. NOTE: real Safari sends NO Cache-Control/Pragma here (build
+// 85 added them by mistake), so vkReq also drops them. Pseudo-header order is
+// left to the Safari_IOS_26_0 profile default (already correct).
+var safariCaptchaHeaderOrder = []string{
+	"accept",
+	"content-type",
+	"sec-fetch-site",
+	"origin",
+	"sec-fetch-mode",
+	"user-agent",
+	"referer",
+	"sec-fetch-dest",
+	"content-length",
+	"accept-language",
+	"priority",
+	"accept-encoding",
+	"cookie",
+}
+
+// applyChromeHints adds desktop-Chrome Client-Hint headers (sec-ch-ua*),
+// en-US Accept-Language, and DNT to a captcha-session request when
+// VK_DESKTOP_CHROME=1. No-op in the production Safari path (Safari does not
+// send sec-ch-ua). Mirrors amurcanov's applyBrowserProfileFhttp. Call AFTER
+// the per-request inline Header.Set block so it overrides Accept-Language.
+func applyChromeHints(req *fhttp.Request) {
+	p := desktopChromeProfile()
+	if p == nil {
+		return
+	}
+	req.Header.Set("sec-ch-ua", p.SecChUA())
+	req.Header.Set("sec-ch-ua-mobile", "?0")
+	req.Header.Set("sec-ch-ua-platform", p.SecChUAPlatform())
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("DNT", "1")
+}
+
 // customSafariIOS26Profile returns a captcha session profile with a
 // hand-crafted TLS ClientHello matching real Safari iOS 26 byte-for-byte,
 // extracted from pcap captured 2026-05-16 (captcha-capture.pcap, frame 32,
@@ -378,20 +501,29 @@ var (
 // persist. Exported (capitalized) so creds.go and proxy.go can call it.
 func GetSessionClient() tls_client.HttpClient {
 	sessionClientOnce.Do(func() {
-		// Phase 9 spec diagnostic — confirms what TLS bytes we send.
-		// Phase 10 expected: ciphers=14 extensions=15 random_ext_order=false.
-		spec, err := buildCustomSafariIOS26Spec()
-		if err != nil {
-			log.Printf("pow: TLS profile spec build ERROR: %v", err)
+		var clientProfile profiles.ClientProfile
+		if desktopChromeProfile() != nil {
+			// VK_DESKTOP_CHROME diagnostic: real Chrome 146 JA3 to match the
+			// desktop UA + sec-ch-ua (same profile amurcanov uses).
+			clientProfile = profiles.Chrome_146
+			log.Printf("pow: TLS profile=Chrome_146 (bogdanfinn built-in) — VK_DESKTOP_CHROME diagnostic mode")
 		} else {
-			log.Printf("pow: TLS profile=Safari_iOS_26_custom ciphers=%d extensions=%d random_ext_order=false (Phase 9 spec, Phase 10 session-unified across bootstrap+captcha)",
-				len(spec.CipherSuites), len(spec.Extensions))
+			// Phase 9 spec diagnostic — confirms what TLS bytes we send.
+			// Phase 10 expected: ciphers=14 extensions=15 random_ext_order=false.
+			clientProfile = customSafariIOS26Profile()
+			spec, err := buildCustomSafariIOS26Spec()
+			if err != nil {
+				log.Printf("pow: TLS profile spec build ERROR: %v", err)
+			} else {
+				log.Printf("pow: TLS profile=Safari_iOS_26_custom ciphers=%d extensions=%d random_ext_order=false (Phase 9 spec, Phase 10 session-unified across bootstrap+captcha)",
+					len(spec.CipherSuites), len(spec.Extensions))
+			}
 		}
 
 		jar := tls_client.NewCookieJar()
 		options := []tls_client.HttpClientOption{
 			tls_client.WithTimeoutSeconds(20),
-			tls_client.WithClientProfile(customSafariIOS26Profile()),
+			tls_client.WithClientProfile(clientProfile),
 			tls_client.WithCookieJar(jar),
 		}
 		client, cerr := tls_client.NewHttpClient(tls_client.NewNoopLogger(), options...)
@@ -413,6 +545,9 @@ func GetSessionClient() tls_client.HttpClient {
 // Phase 10: replaces creds.go's randomUserAgent() — random Chrome UAs were
 // inconsistent with the Safari TLS profile and with the captured browser_fp.
 func GetSessionUserAgent() string {
+	if p := desktopChromeProfile(); p != nil {
+		return p.UserAgent
+	}
 	if saved := loadSavedVKProfile(); saved != nil && saved.UserAgent != "" {
 		return saved.UserAgent
 	}
@@ -446,14 +581,19 @@ func newHTTPClient() *http.Client {
 // caller (creds.go) uses it as a signal for retry/backoff decisions.
 func solveCaptchaPoW(ctx context.Context, redirectURI, captchaSID, userAgent string) (string, string, error) {
 	captchaPowProfile = profileForUA(userAgent)
-	// If we have a captured browser profile (from WKWebView capture saved
-	// to vk_profile.json), override the UA derived from the input userAgent
-	// param. The captured UA is the one VK saw when computing the captured
-	// browser_fp; sending a mismatched UA to validate that fp triggers BOT.
-	// Before this override (2026-05-11) we sent UA=Chrome desktop while the
-	// captured browser_fp was computed for Safari iOS Mobile — guaranteed
-	// fingerprint inconsistency on every check.
-	if saved := loadSavedVKProfile(); saved != nil && saved.UserAgent != "" {
+	if p := desktopChromeProfile(); p != nil {
+		// VK_DESKTOP_CHROME diagnostic: pin the entire identity to Chrome 146
+		// and ignore any captured iPhone Safari profile (its UA/fp/device are
+		// suppressed below in componentDone too).
+		captchaPowProfile = *p
+	} else if saved := loadSavedVKProfile(); saved != nil && saved.UserAgent != "" {
+		// If we have a captured browser profile (from WKWebView capture saved
+		// to vk_profile.json), override the UA derived from the input userAgent
+		// param. The captured UA is the one VK saw when computing the captured
+		// browser_fp; sending a mismatched UA to validate that fp triggers BOT.
+		// Before this override (2026-05-11) we sent UA=Chrome desktop while the
+		// captured browser_fp was computed for Safari iOS Mobile — guaranteed
+		// fingerprint inconsistency on every check.
 		captchaPowProfile.UserAgent = saved.UserAgent
 	}
 	log.Printf("pow: attempting automatic captcha solve (UA: %s, platform: %s, Chrome/%d)",
@@ -604,6 +744,7 @@ func fetchAndCacheDebugInfo(ctx context.Context, client tls_client.HttpClient, s
 	req.Header.Set("Sec-Fetch-Dest", "script")
 	req.Header.Set("Sec-Fetch-Mode", "no-cors")
 	req.Header.Set("Sec-Fetch-Site", "same-site")
+	applyChromeHints(req)
 	resp, err := client.Do(req)
 	if err != nil {
 		log.Printf("pow: debug_info fetch failed (%v) — falling back to hardcoded constant", err)
@@ -654,6 +795,7 @@ func fetchPoW(ctx context.Context, client tls_client.HttpClient, redirectURI str
 	req.Header.Set("Sec-Fetch-Site", "none")
 	req.Header.Set("Sec-Fetch-User", "?1")
 	req.Header.Set("Upgrade-Insecure-Requests", "1")
+	applyChromeHints(req)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -919,6 +1061,7 @@ func fetchMailRuSyncLoader(ctx context.Context, client tls_client.HttpClient) {
 	req.Header.Set("Sec-Fetch-Dest", "script")
 	req.Header.Set("Sec-Fetch-Mode", "no-cors")
 	req.Header.Set("Sec-Fetch-Site", "cross-site")
+	applyChromeHints(req)
 	resp, err := client.Do(req)
 	if err != nil {
 		log.Printf("pow: fetchMailRuSyncLoader failed (non-fatal): %v", err)
@@ -948,13 +1091,23 @@ func fetchMailRuSyncLoader(ctx context.Context, client tls_client.HttpClient) {
 // Phase 11 (build 106) — replaces previous fetchAdFpPing (a GET that
 // matched older Safari capture but the proper call is POST with body).
 func registerAdFpWithMailRu(ctx context.Context, client tls_client.HttpClient, adFp string) {
-	// Captured body shape from 2026-05-17 WebView mitm:
+	// Captured body shape from 2026-05-17 WebView mitm (iPhone 375x667).
+	// In desktop-Chrome diagnostic mode, swap the mobile screen + en-GB for a
+	// 1920x1080 desktop screen + en-US so this stays consistent with the
+	// Chrome identity (this POST is non-load-bearing — VK does not validate
+	// adFp against mail.ru — but keep it coherent anyway).
+	navLang := "en-GB (en-GB)"
+	screenRes := "667;375"
+	if desktopChromeProfile() != nil {
+		navLang = "en-US (en-US)"
+		screenRes = "1080;1920"
+	}
 	body := fmt.Sprintf(
 		`{"script":{"v":"v4.0.3","b_id":"152552442"},`+
-			`"navigator":{"language":"en-GB (en-GB)","plugins_hash":"f8a4506236a7ac2d7ac1251468bbdc2b","properties_hash":"f34e97527ec40c1deeb748830014d230","userAgent":"%s"},`+
-			`"screen":{"availableScreenResolution":"667;375","screenResolution":"667;375"},`+
+			`"navigator":{"language":"%s","plugins_hash":"f8a4506236a7ac2d7ac1251468bbdc2b","properties_hash":"f34e97527ec40c1deeb748830014d230","userAgent":"%s"},`+
+			`"screen":{"availableScreenResolution":"%s","screenResolution":"%s"},`+
 			`"sendReason":1}`,
-		captchaPowProfile.UserAgent)
+		navLang, captchaPowProfile.UserAgent, screenRes, screenRes)
 
 	fpURL := "https://privacy-cs.mail.ru/fp/?id=" + adFp
 	req, err := fhttp.NewRequestWithContext(ctx, "POST", fpURL, strings.NewReader(body))
@@ -972,6 +1125,7 @@ func registerAdFpWithMailRu(ctx context.Context, client tls_client.HttpClient, a
 	req.Header.Set("Sec-Fetch-Dest", "empty")
 	req.Header.Set("Sec-Fetch-Mode", "cors")
 	req.Header.Set("Sec-Fetch-Site", "cross-site")
+	applyChromeHints(req)
 	resp, err := client.Do(req)
 	if err != nil {
 		log.Printf("pow: registerAdFpWithMailRu failed (non-fatal): %v", err)
@@ -1027,6 +1181,7 @@ func fetchAppTracerSession(ctx context.Context, client tls_client.HttpClient) {
 	req.Header.Set("Sec-Fetch-Dest", "empty")
 	req.Header.Set("Sec-Fetch-Mode", "cors")
 	req.Header.Set("Sec-Fetch-Site", "cross-site")
+	applyChromeHints(req)
 	resp, err := client.Do(req)
 	if err != nil {
 		log.Printf("pow: fetchAppTracerSession failed (non-fatal): %v", err)
@@ -1084,6 +1239,37 @@ func callCaptchaNotRobotAPI(ctx context.Context, client tls_client.HttpClient, s
 		req.Header.Set("Sec-Fetch-Dest", "empty")
 		req.Header.Set("Sec-Fetch-Mode", "cors")
 		req.Header.Set("Sec-Fetch-Site", "same-site")
+		applyChromeHints(req)
+		if desktopChromeProfile() != nil {
+			// THE FIX (2026-05-30): VK fingerprints the HTTP/2 header ORDER on
+			// captchaNotRobot.* and flags our default (uncontrolled bogdanfinn
+			// order) as BOT. amurcanov pins Chrome's order and gets checkbox
+			// status=OK on the SAME IP/creds where we got BOT — proven by A/B
+			// in their own code (only the header-order axis flips the verdict).
+			// Match it: pin the order + drop the Safari-only Cache-Control/
+			// Pragma so our header SET fits the order list, and use Priority
+			// u=1,i. Gated on desktop-Chrome (the order list assumes the
+			// sec-ch-ua* headers we only send in that mode).
+			req.Header.Del("Cache-Control")
+			req.Header.Del("Pragma")
+			req.Header.Set("Priority", "u=1, i")
+			req.Header[fhttp.HeaderOrderKey] = chromeCaptchaHeaderOrder
+			req.Header[fhttp.PHeaderOrderKey] = chromeCaptchaPHeaderOrder
+		} else {
+			// PRODUCTION FIX (2026-05-30): pin real Safari WKWebView header
+			// order + drop the spurious Cache-Control/Pragma (real Safari sends
+			// neither on captchaNotRobot.* per the 2026-05-17 mitm). The HTTP/2
+			// header ORDER was THE captcha discriminator: bogdanfinn's
+			// uncontrolled default order ≠ real Safari, so VK flagged us BOT
+			// since the 2026-05-15 update. With the order pinned,
+			// captchaNotRobot.check returns status=OK — verified on multiple IPs
+			// with BOTH captured and generated browser_fp. Keeps the full Safari
+			// identity (TLS/UA/captured profile/adFp/preflight) consistent with
+			// the WKWebView manual-solve fallback.
+			req.Header.Del("Cache-Control")
+			req.Header.Del("Pragma")
+			req.Header[fhttp.HeaderOrderKey] = safariCaptchaHeaderOrder
+		}
 
 		// Phase 3 diagnostic: surface what cookies we're sending to VK.
 		// Real Safari sends remixlang/remixstid/remixstlid on every
@@ -1201,7 +1387,15 @@ func callCaptchaNotRobotAPI(ctx context.Context, client tls_client.HttpClient, s
 	deviceBytes, _ := json.Marshal(deviceMap)
 	deviceParam := url.QueryEscape(string(deviceBytes))
 
-	if saved := loadSavedVKProfile(); saved != nil {
+	if desktopChromeProfile() != nil {
+		// VK_DESKTOP_CHROME diagnostic: keep the RANDOM browser_fp generated
+		// above and send the desktop 1920x1080 device blob (amurcanov's exact
+		// known-working value). Do NOT load the captured iPhone profile — its
+		// Safari fp/device would contradict the Chrome TLS+UA+sec-ch-ua.
+		deviceParam = url.QueryEscape(desktopChromeDeviceJSON)
+		log.Printf("pow: desktop-Chrome mode — random browser_fp=%s (len=%d) + 1920x1080 device (captured iPhone profile ignored)",
+			browserFp[:min(8, len(browserFp))], len(browserFp))
+	} else if saved := loadSavedVKProfile(); saved != nil {
 		ageDays := (float64(time.Now().Unix()) - saved.CapturedAt) / 86400.0
 		log.Printf("pow: using captured browser profile (browser_fp=%dc, device=%dc, captured %.1f days ago)",
 			len(saved.BrowserFp), len(saved.Device), ageDays)
