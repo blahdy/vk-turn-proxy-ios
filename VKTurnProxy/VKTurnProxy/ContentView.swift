@@ -1678,7 +1678,17 @@ struct LogsView: View {
             // doesn't render leftover content.
             fallbackText = ""
             fallbackFetchedAt = .distantPast
-            logText = "(log is empty — waiting for new activity)"
+            // DIAGNOSTIC (build 154): surface the storage facts inline so we
+            // can see WHY the file reads empty — truly 0 bytes vs path skew —
+            // and compare the container path with the extension's
+            // "wgSetLogFilePath: <path>" line in os_log (USB syslog). A
+            // mismatch means the main app and the PacketTunnel extension
+            // resolved DIFFERENT App Group containers (provisioning skew), so
+            // the extension's writes never reach the file the app reads.
+            logText = "(log is empty — waiting for new activity)\n\n" +
+                "[logdiag] container = \(status.containerPath)\n" +
+                "[logdiag] vpn.log   exists=\(status.currentExists) bytes=\(status.currentBytes)\n" +
+                "[logdiag] vpn.log.1 exists=\(status.archivedExists) bytes=\(status.archivedBytes)"
             return
         }
 

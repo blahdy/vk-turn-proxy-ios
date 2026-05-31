@@ -961,6 +961,24 @@ func startLogWriter() {
 			}
 			pending = nil
 			f.WriteString(line)
+			// Batch-drain (build 154): write any further already-queued lines
+			// within this SAME open, so a bootstrap burst (hundreds of
+			// lines/sec) doesn't pay an open+close syscall per line. The
+			// previous per-line open/close couldn't drain logChan fast enough,
+			// the buffer (512) filled, and the NON-blocking osLogWriter sender
+			// silently dropped the overflow — losing most file logs under load
+			// while os_log (USB) still got everything. Reopening per BATCH (not
+			// holding the handle across iterations) stays correct across the
+			// Swift-side rotation rename (vpn.log → vpn.log.1).
+		drain:
+			for {
+				select {
+				case more := <-logChan:
+					f.WriteString(more)
+				default:
+					break drain
+				}
+			}
 			f.Close()
 		}
 	}()
