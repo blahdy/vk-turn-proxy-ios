@@ -68,6 +68,17 @@ const char *wgGetConfig(int32_t tunnelHandle);
 /// @return IP address string (caller must free), empty if not yet connected
 const char *wgGetTURNServerIP(int32_t tunnelHandle);
 
+/// WRAP-A (SRTP-WRAP-A mode): block up to timeoutMs for amurcanov's server to
+/// mint our WireGuard config via GETCONF, then return it as JSON:
+///   {"private_key_hex","peer_public_key_hex","address","dns","mtu",
+///    "keepalive_sec","uapi"}
+/// "uapi" is ready to pass to wgAttachWireGuard; address/dns/mtu feed the
+/// NEPacketTunnelNetworkSettings. Call AFTER wgWaitBootstrapReady returns 1
+/// when use_wrap_a is set. Returns "" (caller must free) on timeout/error or
+/// when the tunnel is not in WRAP-A mode.
+/// @return JSON string (caller must free)
+const char *wgWaitWrapAProvision(int32_t tunnelHandle, int32_t timeoutMs);
+
 /// Get tunnel statistics as JSON.
 /// @return JSON string (caller must free), empty "{}" if tunnel not found
 const char *wgGetStats(int32_t tunnelHandle);

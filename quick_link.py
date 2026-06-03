@@ -73,6 +73,17 @@ the importer's current value with empty):
                        if your network blocks/throttles TCP to the relay and
                        you'd rather take VK's allocation-rate hit. If absent,
                        importer keeps current value (default false / TCP).
+    useWrapA         — bool, added 2026-06-03 (iOS SRTP-WRAP-A mode). True =
+                       connect to amurcanov's proxy-turn-vk-android server. The
+                       server provisions WireGuard via GETCONF, so a WRAP-A
+                       link carries NO WG keys — DELETE privateKey /
+                       peerPublicKey / tunnelAddress / allowedIPs from CONFIG
+                       (they're Optional on the iOS side as of this build).
+                       Only vkLink, peerAddress (the amurcanov server host:port)
+                       and wrapAPassword are required. If absent, importer keeps
+                       its current value (default false).
+    wrapAPassword    — string. The amurcanov shared secret (obfuscation key +
+                       GETCONF auth). Required when useWrapA=True.
 
 Compat note: links generated against iOS build 128 or earlier MUST include
 useDTLS, useWrap, and wrapKeyHex (iOS Codable rejects the link otherwise).
@@ -134,12 +145,28 @@ CONFIG = {
     # useUDP=true only if your network requires UDP-control transport.
     "useSrtp":        False,
     "useUDP":         False,
+    # ----- SRTP-WRAP-A (amurcanov interop) -----
+    # To target amurcanov's proxy-turn-vk-android server: uncomment the two
+    # lines below (set a real wrapAPassword) and DELETE the WireGuard fields
+    # above (privateKey / peerPublicKey / tunnelAddress / allowedIPs) — the
+    # server provisions WireGuard via GETCONF, so a WRAP-A link carries no WG
+    # keys. peerAddress must be the amurcanov server's host:port. Only vkLink +
+    # peerAddress + wrapAPassword are required in this mode.
+    # "useWrapA":       True,
+    # "wrapAPassword":  "REPLACE_ME",
 }
 
 REQUIRED = (
     "privateKey", "peerPublicKey",
     "tunnelAddress", "allowedIPs",
     "vkLink", "peerAddress",
+)
+
+# SRTP-WRAP-A (amurcanov interop) links carry NO WireGuard keys — the server
+# provisions them via GETCONF. Only the password + server address + vkLink are
+# required. Selected when CONFIG sets useWrapA=True.
+REQUIRED_WRAPA = (
+    "wrapAPassword", "vkLink", "peerAddress",
 )
 
 # Schema version must match BackupManager.supportedConfigVersion in the
@@ -157,8 +184,11 @@ def load_config(argv):
 
 
 def validate(settings):
+    # WRAP-A links carry no WG keys (server-provisioned via GETCONF), so
+    # validate the smaller required set when useWrapA is on.
+    required = REQUIRED_WRAPA if settings.get("useWrapA") else REQUIRED
     missing = []
-    for key in REQUIRED:
+    for key in required:
         val = settings.get(key)
         if val in (None, "", "REPLACE_ME"):
             missing.append(key)

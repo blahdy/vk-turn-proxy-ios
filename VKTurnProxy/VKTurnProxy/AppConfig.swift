@@ -99,6 +99,15 @@ struct AppSettings: Codable {
     /// slower. Optional for back-compat with backups exported before
     /// this build — nil leaves the AppStorage default (false / TCP).
     let useUDP: Bool?
+    /// WRAP-A (amurcanov-compatible 4th transport mode, added 2026-06-03).
+    /// Optional for back-compat with backups exported before WRAP-A shipped —
+    /// nil leaves the AppStorage default (false). The per-install deviceID is
+    /// deliberately NOT backed up (device identity, regenerated on fresh
+    /// install so two devices never collide on the server's WG-peer pool).
+    let useWrapA: Bool?
+    /// WRAP-A shared secret (obfuscation key + GETCONF auth). Optional for
+    /// back-compat. Plaintext like the WG private key above.
+    let wrapAPassword: String?
     /// UNDOCUMENTED on-device captcha-test toggle (build 149): when true the
     /// extension skips the captcha-free VK Calls path so the legacy
     /// captchaNotRobot.* solver runs — lets a tester exercise the captcha fix
@@ -146,8 +155,15 @@ struct ConnectionLink: Codable {
 /// address + vkLink + WRAP key are all required; per-device tunables
 /// (dnsServers, numConnections) are optional.
 struct ConnectionSettings: Codable {
-    let privateKey: String
-    let peerPublicKey: String
+    /// privateKey / peerPublicKey / tunnelAddress / allowedIPs made Optional
+    /// 2026-06-03 so a WRAP-A link can omit them entirely — amurcanov's server
+    /// provisions WireGuard via GETCONF, so a WRAP-A deployment has no client-
+    /// chosen WG keys. Nil-preserves-default on import (absent → keep the
+    /// device's current value, so switching modes later doesn't lose keys).
+    /// Non-WRAP-A links still include them; quick_link.py requires them unless
+    /// useWrapA is set.
+    let privateKey: String?
+    let peerPublicKey: String?
     /// presharedKey made Optional in build 134 — WireGuard PSK is
     /// optional in the protocol (RFC 4193 §5.2: "If a PSK is not
     /// configured, then it is assumed to be all zeros"), so deployments
@@ -159,8 +175,8 @@ struct ConnectionSettings: Codable {
     /// remains required because currentConfig() always populates it from
     /// UserDefaults.
     let presharedKey: String?
-    let tunnelAddress: String
-    let allowedIPs: String
+    let tunnelAddress: String?
+    let allowedIPs: String?
     let vkLink: String
     let peerAddress: String
     /// useDTLS / useWrap / wrapKeyHex made Optional in build 129. UI
@@ -184,6 +200,13 @@ struct ConnectionSettings: Codable {
     /// for back-compat — receiving device keeps its current useUDP
     /// value (default false / TCP) if absent in the link payload.
     let useUDP: Bool?
+    /// WRAP-A (amurcanov interop) mode + password (added 2026-06-03). This is
+    /// the 1-click payload the "how do I reach amurcanov's server from iOS"
+    /// askers need: a link of {peerAddress, useWrapA:true, wrapAPassword}
+    /// auto-provisions WireGuard via GETCONF — NO WG keys in the link.
+    /// Optional for back-compat; nil keeps the device's current value.
+    let useWrapA: Bool?
+    let wrapAPassword: String?
     /// Optional: if absent, the importing device keeps its current
     /// dnsServers value (or the AppStorage default of "1.1.1.1" if
     /// never set). Always set on apply when present.

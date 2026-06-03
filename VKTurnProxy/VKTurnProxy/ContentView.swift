@@ -35,6 +35,13 @@ struct ContentView: View {
     // the production path since build 115+. Existing installs keep
     // whatever they had set explicitly.
     @AppStorage("useSrtp") private var useSrtp = true
+    // useWrapA / wrapAPassword: the 4th "SRTP-WRAP-A" server mode (amurcanov
+    // interop, added 2026-06-03). useWrapA takes priority over the
+    // (useSrtp, useWrap) pair. wrapAPassword is the single secret the user
+    // enters — it derives the obfuscation key AND authenticates GETCONF; the
+    // WireGuard keys/address are server-provisioned (no WG fields needed).
+    @AppStorage("useWrapA") private var useWrapA = false
+    @AppStorage("wrapAPassword") private var wrapAPassword = ""
     // useUDP toggles TURN control transport: UDP (true) vs TCP (false,
     // default). Surfaced in Settings build 128. TCP-control bypasses
     // VK's per-cred allocation-rate throttle introduced 2026-05-18 —
@@ -112,6 +119,8 @@ struct ContentView: View {
                                 useWrap: useWrap,
                                 wrapKeyHex: wrapKeyHex,
                                 useSrtp: useSrtp,
+                                useWrapA: useWrapA,
+                                wrapAPassword: wrapAPassword,
                                 useUDP: useUDP,
                                 forceLegacyCaptcha: UserDefaults.standard.bool(forKey: "forceLegacyCaptcha"),
                                 numConnections: numConnections,
@@ -242,6 +251,11 @@ enum ServerMode: Int, CaseIterable, Identifiable {
     case legacy = 0
     case srtp = 1
     case srtpWrap = 2
+    // srtpWrapA: interop with amurcanov's proxy-turn-vk-android server.
+    // Gated by a separate @AppStorage("useWrapA") flag (the (useSrtp,useWrap)
+    // pair is already saturated). NOT SRTP despite the grouping — WRAP-A
+    // RTP-obfs → plain DTLS → GETCONF auto-provisioning → WireGuard.
+    case srtpWrapA = 3
 
     var id: Int { rawValue }
 
@@ -250,6 +264,7 @@ enum ServerMode: Int, CaseIterable, Identifiable {
         case .legacy: return "Legacy (DTLS+WG)"
         case .srtp: return "SRTP"
         case .srtpWrap: return "SRTP+WRAP"
+        case .srtpWrapA: return "SRTP-WRAP-A (amurcanov)"
         }
     }
 }
@@ -281,6 +296,13 @@ struct SettingsView: View {
     // the production path since build 115+. Existing installs keep
     // whatever they had set explicitly.
     @AppStorage("useSrtp") private var useSrtp = true
+    // useWrapA / wrapAPassword: the 4th "SRTP-WRAP-A" server mode (amurcanov
+    // interop, added 2026-06-03). useWrapA takes priority over the
+    // (useSrtp, useWrap) pair. wrapAPassword is the single secret the user
+    // enters — it derives the obfuscation key AND authenticates GETCONF; the
+    // WireGuard keys/address are server-provisioned (no WG fields needed).
+    @AppStorage("useWrapA") private var useWrapA = false
+    @AppStorage("wrapAPassword") private var wrapAPassword = ""
     // useUDP toggles TURN control transport: UDP (true) vs TCP (false,
     // default). Surfaced in Settings build 128. TCP-control bypasses
     // VK's per-cred allocation-rate throttle introduced 2026-05-18 —
@@ -331,6 +353,7 @@ struct SettingsView: View {
     private var serverModeBinding: Binding<ServerMode> {
         Binding(
             get: {
+                if useWrapA { return .srtpWrapA }
                 if useSrtp { return .srtp }
                 if useWrap { return .srtpWrap }
                 return .legacy
@@ -338,14 +361,21 @@ struct SettingsView: View {
             set: { newMode in
                 switch newMode {
                 case .legacy:
+                    useWrapA = false
                     useSrtp = false
                     useWrap = false
                 case .srtp:
+                    useWrapA = false
                     useSrtp = true
                     useWrap = false
                 case .srtpWrap:
+                    useWrapA = false
                     useSrtp = false
                     useWrap = true
+                case .srtpWrapA:
+                    useWrapA = true
+                    useSrtp = false
+                    useWrap = false
                 }
             }
         )
@@ -424,6 +454,17 @@ struct SettingsView: View {
                         .disableAutocorrection(true)
                 }
 
+                // SRTP-WRAP-A (amurcanov interop): the server provisions
+                // WireGuard via GETCONF, so the user enters ONE secret — no WG
+                // keys (the WireGuard section below is hidden in this mode).
+                // A wrong/empty password surfaces as a clean GETCONF
+                // DENIED / DTLS handshake failure in the logs.
+                if serverModeBinding.wrappedValue == .srtpWrapA {
+                    SecureField("Password (amurcanov server)", text: $wrapAPassword)
+                        .autocapitalization(.none)
+                        .disableAutocorrection(true)
+                }
+
                 // TURN control transport: UDP (true) vs TCP (false /
                 // default). TCP-control bypasses VK's per-cred allocation-
                 // rate throttle introduced 2026-05-18 — empirically ~0%
@@ -450,6 +491,10 @@ struct SettingsView: View {
                 Stepper("Cred pool cooldown: \(credPoolCooldownSeconds) s", value: $credPoolCooldownSeconds, in: 30...600, step: 30)
             }
 
+            // WireGuard keys/address are user-entered for Legacy / SRTP /
+            // SRTP+WRAP. In SRTP-WRAP-A they're minted by the server via
+            // GETCONF, so hide the whole section in that mode.
+            if serverModeBinding.wrappedValue != .srtpWrapA {
             Section("WireGuard") {
                 SecureField("Private Key (base64)", text: $privateKey)
                     .autocapitalization(.none)
@@ -472,6 +517,7 @@ struct SettingsView: View {
                 TextField("Allowed IPs", text: $allowedIPs)
                     .autocapitalization(.none)
             }
+            } // end `if != .srtpWrapA` — WireGuard section hidden in WRAP-A mode
 
             Section {
                 Button(action: handleExport) {

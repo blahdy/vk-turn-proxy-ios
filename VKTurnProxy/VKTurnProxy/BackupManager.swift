@@ -104,7 +104,12 @@ enum BackupManager {
             // useUDP default false matches SettingsView's @AppStorage
             // default — TCP-control was made default in build 109 to
             // bypass VK's per-cred allocation-rate throttle.
-            useUDP: (d.object(forKey: "useUDP") as? Bool) ?? false
+            useUDP: (d.object(forKey: "useUDP") as? Bool) ?? false,
+            // WRAP-A (amurcanov interop, 2026-06-03): export the mode +
+            // password so a full backup round-trips it. deviceID is NOT
+            // exported (per-install identity).
+            useWrapA: (d.object(forKey: "useWrapA") as? Bool) ?? false,
+            wrapAPassword: d.string(forKey: "wrapAPassword") ?? ""
         )
 
         var turnPool: CredCacheFile? = nil
@@ -233,6 +238,9 @@ enum BackupManager {
         if let v = s.useSrtp { d.set(v, forKey: "useSrtp") }
         // useUDP: same nil-preserves-default pattern.
         if let v = s.useUDP { d.set(v, forKey: "useUDP") }
+        // WRAP-A (amurcanov interop): same nil-preserves-default pattern.
+        if let v = s.useWrapA { d.set(v, forKey: "useWrapA") }
+        if let v = s.wrapAPassword { d.set(v, forKey: "wrapAPassword") }
         // forceLegacyCaptcha: undocumented on-device captcha-test toggle
         // (build 149) — same nil-preserves-default pattern.
         if let v = s.forceLegacyCaptcha { d.set(v, forKey: "forceLegacyCaptcha") }
@@ -405,16 +413,19 @@ enum BackupManager {
     static func applyConnectionLink(_ link: ConnectionLink) {
         let d = UserDefaults.standard
         let s = link.settings
-        d.set(s.privateKey, forKey: "privateKey")
-        d.set(s.peerPublicKey, forKey: "peerPublicKey")
+        // privateKey/peerPublicKey/tunnelAddress/allowedIPs Optional since
+        // 2026-06-03 (a WRAP-A link omits them; the server provisions WG via
+        // GETCONF). Nil-preserves-default keeps the device's existing keys.
+        if let v = s.privateKey { d.set(v, forKey: "privateKey") }
+        if let v = s.peerPublicKey { d.set(v, forKey: "peerPublicKey") }
         // presharedKey made Optional in build 134 — WG PSK is optional in
         // the protocol; deployments without one omit the field entirely
         // (quick_link.py does that automatically). Nil-preserves-default
         // keeps the device's current PSK alone when absent. Non-nil writes
         // through, including empty string if explicitly set.
         if let v = s.presharedKey { d.set(v, forKey: "presharedKey") }
-        d.set(s.tunnelAddress, forKey: "tunnelAddress")
-        d.set(s.allowedIPs, forKey: "allowedIPs")
+        if let v = s.tunnelAddress { d.set(v, forKey: "tunnelAddress") }
+        if let v = s.allowedIPs { d.set(v, forKey: "allowedIPs") }
         d.set(s.vkLink, forKey: "vkLink")
         d.set(s.peerAddress, forKey: "peerAddress")
         // useDTLS/useWrap/wrapKeyHex made Optional in build 129 — UI
@@ -432,6 +443,10 @@ enum BackupManager {
         // useUDP optional in ConnectionSettings (added build 128): same
         // keep-current-on-absent semantics as useSrtp.
         if let v = s.useUDP { d.set(v, forKey: "useUDP") }
+        // WRAP-A mode + password (the 1-click amurcanov payload) — nil-
+        // preserves-default like the toggles above.
+        if let v = s.useWrapA { d.set(v, forKey: "useWrapA") }
+        if let v = s.wrapAPassword { d.set(v, forKey: "wrapAPassword") }
         if let v = s.dnsServers { d.set(v, forKey: "dnsServers") }
         if let v = s.numConnections { d.set(v, forKey: "numConnections") }
         // Truncate vkLink and peerAddress in the log so we don't dump

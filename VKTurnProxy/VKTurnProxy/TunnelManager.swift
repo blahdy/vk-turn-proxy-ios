@@ -401,7 +401,11 @@ class TunnelManager: ObservableObject {
                 "proxy_config": proxyConfig,
                 "tunnel_address": config.tunnelAddress,
                 "dns_servers": config.dnsServers,
-                "mtu": config.mtu
+                "mtu": config.mtu,
+                // WRAP-A: tells the extension to fetch the GETCONF-minted WG
+                // config (wgWaitWrapAProvision) and override wg_config +
+                // address/dns/mtu after bootstrap, since the user entered none.
+                "use_wrap_a": config.useWrapA
             ]
 
             // Full-tunnel mode (Step 4 of the APNs-through-tunnel refactor).
@@ -1139,6 +1143,14 @@ class TunnelManager: ObservableObject {
     }
 
     private func buildUAPIConfig(config: TunnelConfig) throws -> String {
+        // WRAP-A: the user enters no WireGuard keys — amurcanov's server mints
+        // them via GETCONF and the extension applies the result
+        // (wgWaitWrapAProvision) instead of this string. Return a harmless
+        // placeholder so connect() doesn't fail Base64 validation on the empty
+        // key fields.
+        if config.useWrapA {
+            return ""
+        }
         var lines: [String] = []
         lines.append("private_key=\(try parseWireGuardKey(config.privateKey, field: "Private Key"))")
         lines.append("replace_peers=true")
@@ -1164,6 +1176,23 @@ class TunnelManager: ObservableObject {
         return lines.joined(separator: "\n")
     }
 
+    /// Stable per-install device identifier for WRAP-A GETCONF, persisted in
+    /// the App Group so it survives relaunch (the server keys the minted
+    /// WireGuard device + IP on it, so it must be constant across reconnects).
+    /// NOT included in backups/links — it is device identity, not deployment
+    /// config; a fresh install mints a new one so two devices never collide on
+    /// amurcanov's server WG-peer pool. Generated lazily on first WRAP-A use.
+    private func wrapADeviceID() -> String {
+        let suite = UserDefaults(suiteName: "group.com.vkturnproxy.app")
+        if let existing = suite?.string(forKey: "wrapADeviceID"), !existing.isEmpty {
+            return existing
+        }
+        let id = UUID().uuidString
+        suite?.set(id, forKey: "wrapADeviceID")
+        SharedLogger.shared.log("[AppDebug] WRAP-A: generated stable deviceID \(id)")
+        return id
+    }
+
     private func buildProxyConfig(
         config: TunnelConfig,
         vkHostIPs: [String: [String]] = [:],
@@ -1183,6 +1212,15 @@ class TunnelManager: ObservableObject {
             "turn_server": config.turnServerOverride ?? "",
             "turn_port": config.turnPortOverride ?? ""
         ]
+        // WRAP-A (amurcanov interop): the server provisions WireGuard via
+        // GETCONF, so we send the password + a stable deviceID instead of WG
+        // keys. Gated so non-WRAP-A users don't get the keys (or a generated
+        // deviceID) in their proxy config at all.
+        if config.useWrapA {
+            dict["use_wrap_a"] = true
+            dict["wrap_a_password"] = config.wrapAPassword
+            dict["device_id"] = wrapADeviceID()
+        }
         if !vkHostIPs.isEmpty {
             dict["vk_host_ips"] = vkHostIPs
         }
@@ -1478,6 +1516,16 @@ struct TunnelConfig {
     // production layout yields ~50 Mbps total tunnel throughput (vs
     // ~2 Mbps for the standard DTLS+WG path).
     var useSrtp: Bool = false
+    // WRAP-A (amurcanov-compatible) 4th transport mode. The peer is
+    // amurcanov's proxy-turn-vk-android server; it provisions our WireGuard
+    // keypair + IP via GETCONF over a WRAP-A+DTLS channel, so the user enters
+    // NO WG keys — only peerAddress + wrapAPassword. NOT SRTP despite the UI
+    // grouping. See pkg/proxy/wrapa.go + getconf.go; the extension fetches the
+    // minted config via wgWaitWrapAProvision after bootstrap.
+    var useWrapA: Bool = false
+    // Shared secret for WRAP-A: HKDF input for the obfuscation key AND GETCONF
+    // authentication. One field. Required when useWrapA=true.
+    var wrapAPassword: String = ""
     // 2026-05-18 empirical: VK's new per-cred TURN allocation-rate
     // throttle (introduced ~16:00 MSK that day) applies ONLY to UDP-
     // transport allocations. 11×10 = 110 TCP-control allocations on a

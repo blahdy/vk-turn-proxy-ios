@@ -120,6 +120,11 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         let tunnelAddress = config["tunnel_address"] as? String ?? "192.168.102.3/24"
         let dnsServers = config["dns_servers"] as? String ?? "1.1.1.1"
         let mtu = config["mtu"] as? String ?? "1280"
+        // WRAP-A (amurcanov interop): the server provisions WireGuard via
+        // GETCONF during bootstrap; when set, we fetch the minted config below
+        // (wgWaitWrapAProvision) and override wg_config + address/dns/mtu — the
+        // user entered none of those.
+        let isWrapA = (config["use_wrap_a"] as? Bool) ?? false
 
         logMsg("tunnelAddress=\(tunnelAddress) dns=\(dnsServers) mtu=\(mtu)")
         logMsg("proxyConfig=\(proxyConfigJSON)")
@@ -198,6 +203,43 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 return
             }
 
+            // WRAP-A: fetch the WireGuard config amurcanov's server minted for
+            // us via GETCONF during bootstrap, and override wg_config + the
+            // tunnel address/dns/mtu (the user supplied none — the server
+            // assigns them). Non-WRAP-A keeps the user-supplied values.
+            var effWGConfig = wgConfig
+            var effAddress = tunnelAddress
+            var effDNS = dnsServers
+            var effMTU = mtu
+            if isWrapA {
+                self.logMsg("WRAP-A: fetching GETCONF provision...")
+                guard let provPtr = wgWaitWrapAProvision(handle, 30_000) else {
+                    self.logMsg("ERROR: wgWaitWrapAProvision returned null — aborting")
+                    wgTurnOff(handle)
+                    self.tunnelHandle = -1
+                    completionHandler(VPNError.backendFailed(code: -100))
+                    return
+                }
+                let provJSON = String(cString: provPtr)
+                free(UnsafeMutableRawPointer(mutating: provPtr))
+                guard !provJSON.isEmpty,
+                      let provData = provJSON.data(using: .utf8),
+                      let prov = (try? JSONSerialization.jsonObject(with: provData)) as? [String: Any],
+                      let uapi = prov["uapi"] as? String, !uapi.isEmpty,
+                      let addr = prov["address"] as? String, !addr.isEmpty else {
+                    self.logMsg("ERROR: WRAP-A provision empty/invalid — aborting")
+                    wgTurnOff(handle)
+                    self.tunnelHandle = -1
+                    completionHandler(VPNError.invalidConfiguration)
+                    return
+                }
+                effWGConfig = uapi
+                effAddress = addr
+                if let d = prov["dns"] as? String, !d.isEmpty { effDNS = d }
+                if let m = prov["mtu"] as? Int, m > 0 { effMTU = String(m) }
+                self.logMsg("WRAP-A provisioned: address=\(effAddress) dns=\(effDNS) mtu=\(effMTU)")
+            }
+
             // Read the TURN server IP that Go picked during bootstrap and
             // persist it to the AppGroup so TunnelManager.connect() can use
             // it as NEVPNProtocol.serverAddress on the NEXT connect (Step 3).
@@ -221,9 +263,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             // iOS 16.4+ with our flags — APNs/CellularServices as
             // configured on the main-app side).
             let finalSettings = self.createTunnelSettings(
-                address: tunnelAddress,
-                dns: dnsServers,
-                mtu: mtu,
+                address: effAddress,
+                dns: effDNS,
+                mtu: effMTU,
                 tunnelRemoteAddress: turnIP.isEmpty ? "10.0.0.1" : turnIP
             )
 
@@ -251,7 +293,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                     }
                     self.logMsg("TUN fd=\(tunFd), calling wgAttachWireGuard...")
 
-                    let rc = wgConfig.withCString { cfgPtr in
+                    let rc = effWGConfig.withCString { cfgPtr in
                         wgAttachWireGuard(handle, UnsafeMutablePointer(mutating: cfgPtr), tunFd)
                     }
                     if rc < 0 {
