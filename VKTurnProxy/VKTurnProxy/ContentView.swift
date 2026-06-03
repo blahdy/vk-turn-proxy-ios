@@ -55,6 +55,17 @@ struct ContentView: View {
     @AppStorage("numConnections") private var numConnections = 30
     @AppStorage("credPoolCooldownSeconds") private var credPoolCooldownSeconds = 150
 
+    /// SRTP-WRAP-A requires a non-empty password (it derives the obfuscation
+    /// key AND authenticates GETCONF). An empty password makes the Go side
+    /// disable WRAP-A and silently fall through to the broken direct transport,
+    /// so we block Connect here with a clear message. nil = OK to connect.
+    private var wrapAValidationError: String? {
+        if useWrapA && wrapAPassword.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return "SRTP-WRAP-A requires a server password — set it in Settings."
+        }
+        return nil
+    }
+
     var body: some View {
         NavigationView {
             // ScrollView is the safety net for very small screens
@@ -79,6 +90,17 @@ struct ContentView: View {
                         Text(error)
                             .font(.caption)
                             .foregroundColor(.red)
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal)
+                    }
+
+                    // SRTP-WRAP-A password validation — shown only while
+                    // disconnected (it gates the Connect button below).
+                    if tunnel.status != .connected, tunnel.status != .connecting,
+                       let v = wrapAValidationError {
+                        Text(v)
+                            .font(.caption)
+                            .foregroundColor(.orange)
                             .multilineTextAlignment(.center)
                             .padding(.horizontal)
                     }
@@ -141,6 +163,10 @@ struct ContentView: View {
                     }
                     .padding(.horizontal)
                     .padding(.top, 8)
+                    // Block Connect in SRTP-WRAP-A mode without a password
+                    // (empty password → Go disables WRAP-A → broken direct
+                    // fallback). Never disables the Disconnect action.
+                    .disabled(tunnel.status != .connected && tunnel.status != .connecting && wrapAValidationError != nil)
 
                     // Logs & Settings links
                     HStack(spacing: 24) {
@@ -463,6 +489,11 @@ struct SettingsView: View {
                     SecureField("Password (amurcanov server)", text: $wrapAPassword)
                         .autocapitalization(.none)
                         .disableAutocorrection(true)
+                    if wrapAPassword.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        Text("Required — derives the obfuscation key and authenticates GETCONF.")
+                            .font(.caption)
+                            .foregroundColor(.orange)
+                    }
                 }
 
                 // TURN control transport: UDP (true) vs TCP (false /
