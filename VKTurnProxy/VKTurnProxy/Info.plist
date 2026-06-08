@@ -28,6 +28,7 @@
 			<key>CFBundleURLSchemes</key>
 			<array>
 				<string>vkturnproxy</string>
+				<string>wdtt</string>
 			</array>
 		</dict>
 	</array>

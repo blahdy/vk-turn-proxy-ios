@@ -802,7 +802,7 @@ struct SettingsView: View {
         let raw = UIPasteboard.general.string ?? ""
         if raw.isEmpty {
             alertTitle = "Clipboard Empty"
-            alertMessage = "Copy a vkturnproxy://… link to the clipboard first, then tap this again."
+            alertMessage = "Copy a vkturnproxy:// or wdtt:// link to the clipboard first, then tap this again."
             return
         }
         do {

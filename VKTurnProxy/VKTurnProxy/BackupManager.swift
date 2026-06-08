@@ -349,6 +349,11 @@ enum BackupManager {
     /// the caller can show a single "Connection Link Invalid" alert
     /// with the underlying message.
     static func parseConnectionLink(from url: URL) throws -> ConnectionLink {
+        // amurcanov compat: wdtt:// links use a flat colon-delimited format,
+        // not our base64 payload — route them to the dedicated parser.
+        if url.scheme?.lowercased() == "wdtt" {
+            return try parseWdttLink(url.absoluteString)
+        }
         guard url.scheme?.lowercased() == "vkturnproxy" else {
             throw BackupError.decodeFailed("URL scheme is not vkturnproxy://")
         }
@@ -371,6 +376,10 @@ enum BackupManager {
     /// bare base64 blob — the user might have copied either form.
     static func parseConnectionLinkString(_ raw: String) throws -> ConnectionLink {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        // amurcanov compat: a pasted wdtt:// link (his android server's format).
+        if trimmed.lowercased().hasPrefix("wdtt://") {
+            return try parseWdttLink(trimmed)
+        }
         if let url = URL(string: trimmed), url.scheme?.lowercased() == "vkturnproxy" {
             return try parseConnectionLink(from: url)
         }
@@ -404,6 +413,92 @@ enum BackupManager {
             throw BackupError.decodeFailed("Expected type=connection, got '\(link.type)'")
         }
         return link
+    }
+
+    // MARK: - amurcanov wdtt:// compat link
+
+    /// Parses an amurcanov `wdtt://` link into our ConnectionLink (SRTP-WRAP-A
+    /// mode). Format (verified against proxy-turn-vk-android v1.2.2 —
+    /// server.go link generation + SettingsTab.kt parser):
+    ///
+    ///   wdtt://<IP>:<dtlsPort>:<wgPort>:<localPeerPort>:<password>:<hash[,hash…]>
+    ///
+    /// We use only IP+dtlsPort (→ peerAddress), password (→ wrapAPassword) and
+    /// the FIRST VK hash (→ vkLink = https://vk.com/call/join/<hash>, which our
+    /// Go side reduces to the lastPathComponent token). wgPort/localPeerPort are
+    /// his server-internal / android-loopback values — irrelevant to us (we
+    /// provision WireGuard via GETCONF and route via our own conn.Bind). His
+    /// links can carry up to 4 hashes; we take the first — our credpool already
+    /// grows a full conn pool from a single VK link. His own Android app doesn't
+    /// register the wdtt:// scheme (paste-only), so when WE register it there's
+    /// no handler collision.
+    static func parseWdttLink(_ raw: String) throws -> ConnectionLink {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.lowercased().hasPrefix("wdtt://") else {
+            throw BackupError.decodeFailed("URL scheme is not wdtt://")
+        }
+        let body = String(trimmed.dropFirst("wdtt://".count))
+        // omittingEmptySubsequences:false keeps positional integrity if a field
+        // is empty — matches amurcanov's Kotlin split(":") semantics so our
+        // field indices line up with his.
+        let parts = body.split(separator: ":", omittingEmptySubsequences: false).map(String.init)
+        guard parts.count >= 6 else {
+            throw BackupError.decodeFailed("wdtt:// link needs 6 colon-separated fields, got \(parts.count)")
+        }
+        let ip = parts[0].trimmingCharacters(in: .whitespaces)
+        let dtlsPort = parts[1].trimmingCharacters(in: .whitespaces)
+        // parts[2] = wgPort, parts[3] = localPeerPort — intentionally ignored.
+        let password = parts[4]
+        // parts[5] may be a comma-separated list of VK hashes — take the first.
+        let firstHashRaw = parts[5]
+            .split(separator: ",", omittingEmptySubsequences: false)
+            .first.map(String.init) ?? ""
+        let firstHash = stripVkUrl(firstHashRaw)
+
+        guard !ip.isEmpty, !dtlsPort.isEmpty, Int(dtlsPort) != nil else {
+            throw BackupError.decodeFailed("wdtt:// link has an invalid IP or DTLS port")
+        }
+        guard !password.isEmpty else {
+            throw BackupError.decodeFailed("wdtt:// link is missing the tunnel password")
+        }
+        guard !firstHash.isEmpty else {
+            throw BackupError.decodeFailed("wdtt:// link is missing the VK hash")
+        }
+
+        let settings = ConnectionSettings(
+            privateKey: nil, peerPublicKey: nil, presharedKey: nil,
+            tunnelAddress: nil, allowedIPs: nil,
+            vkLink: "https://vk.com/call/join/" + firstHash,
+            peerAddress: "\(ip):\(dtlsPort)",
+            useDTLS: nil, useWrap: nil, wrapKeyHex: nil,
+            useSrtp: nil, useUDP: nil,
+            useWrapA: true, wrapAPassword: password,
+            turnServerOverride: nil,
+            dnsServers: nil, numConnections: nil
+        )
+        return ConnectionLink(version: supportedConfigVersion, type: "connection", settings: settings)
+    }
+
+    /// Strips a VK call/join URL prefix (+ any query/fragment) from a hash,
+    /// canonicalising to the bare token. Mirrors amurcanov's stripVkUrlStatic;
+    /// also tolerates our own vk.me/join/ form defensively. amurcanov's server
+    /// already emits bare hashes, so this is belt-and-suspenders.
+    private static func stripVkUrl(_ input: String) -> String {
+        var s = input.trimmingCharacters(in: .whitespaces)
+        let prefixes = [
+            "https://vk.com/call/join/", "http://vk.com/call/join/",
+            "https://m.vk.com/call/join/", "http://m.vk.com/call/join/",
+            "m.vk.com/call/join/", "vk.com/call/join/",
+            "https://vk.me/join/", "http://vk.me/join/", "vk.me/join/"
+        ]
+        let lower = s.lowercased()
+        for p in prefixes where lower.hasPrefix(p) {
+            s = String(s.dropFirst(p.count))
+            break
+        }
+        if let q = s.firstIndex(of: "?") { s = String(s[..<q]) }
+        if let h = s.firstIndex(of: "#") { s = String(s[..<h]) }
+        return s.trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
     }
 
     /// Applies the ConnectionLink to UserDefaults. Does NOT touch
