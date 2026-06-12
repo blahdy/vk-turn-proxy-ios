@@ -103,8 +103,8 @@ https://github.com/samosvalishe/vk-turn-proxy/releases
 <img width="750" height="1294" alt="image" src="https://github.com/user-attachments/assets/b423925b-3c3d-480b-802f-639d555a8972" />
 
 - XXX.XXX.XXX.XXX: публичный адрес сервера, на котором запущен WDTT
-- порт - по умолчанию WDTT использует 56000
-- пароль - то, что у WDTT называется "главный пароль туннеля". 
+- порт: по умолчанию WDTT использует 56000
+- пароль: то, что у WDTT называется "главный пароль туннеля". 
 
 ## Автоматические ссылки
 
