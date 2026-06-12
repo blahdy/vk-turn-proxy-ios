@@ -149,14 +149,19 @@ CONFIG = {
     # useUDP=true only if your network requires UDP-control transport.
     "useSrtp":        False,
     "useUDP":         False,
+    # useWrapA is emitted EXPLICITLY (not omitted) so the link fully defines the
+    # server mode. Omitting it caused an import bug (2026-06-10): a non-WRAP-A
+    # link could NOT switch a device OUT of SRTP-WRAP-A — the importer left the
+    # stale useWrapA=true, which wins the (useWrapA > useSrtp > useWrap) mode
+    # precedence and kept the device in the wrong mode. Keep this present.
+    "useWrapA":       False,
     # ----- SRTP-WRAP-A (amurcanov interop) -----
-    # To target amurcanov's proxy-turn-vk-android server: uncomment the two
-    # lines below (set a real wrapAPassword) and DELETE the WireGuard fields
-    # above (privateKey / peerPublicKey / tunnelAddress / allowedIPs) — the
-    # server provisions WireGuard via GETCONF, so a WRAP-A link carries no WG
+    # To target amurcanov's proxy-turn-vk-android server: set useWrapA above to
+    # True, uncomment wrapAPassword below (real value), and DELETE the WireGuard
+    # fields above (privateKey / peerPublicKey / tunnelAddress / allowedIPs) —
+    # the server provisions WireGuard via GETCONF, so a WRAP-A link carries no WG
     # keys. peerAddress must be the amurcanov server's host:port. Only vkLink +
     # peerAddress + wrapAPassword are required in this mode.
-    # "useWrapA":       True,
     # "wrapAPassword":  "REPLACE_ME",
     # ----- TURN server override (optional) -----
     # Force fresh conns onto a specific TURN relay instead of whatever VK

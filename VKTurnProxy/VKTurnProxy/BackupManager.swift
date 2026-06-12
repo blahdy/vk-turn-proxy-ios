@@ -532,27 +532,40 @@ enum BackupManager {
         // Older quick_link.py-generated links that still carry these
         // fields apply them through unchanged.
         if let v = s.useDTLS { d.set(v, forKey: "useDTLS") }
-        if let v = s.useWrap { d.set(v, forKey: "useWrap") }
         if let v = s.wrapKeyHex { d.set(v, forKey: "wrapKeyHex") }
-        // useSrtp optional in ConnectionSettings (added 2026-05-20): if
-        // absent, keep whatever the device currently has (default false).
-        if let v = s.useSrtp { d.set(v, forKey: "useSrtp") }
-        // useUDP optional in ConnectionSettings (added build 128): same
-        // keep-current-on-absent semantics as useSrtp.
+        // Server-mode triple (useWrapA / useSrtp / useWrap) encodes ONE enum
+        // with precedence useWrapA > useSrtp > useWrap (see ServerMode +
+        // serverModeBinding). It MUST be applied as a COUPLED set, not as three
+        // independent nil-preserve writes — otherwise a stale flag survives: a
+        // link with useSrtp:true but no useWrapA could NOT switch a device OUT
+        // of SRTP-WRAP-A, because the leftover useWrapA=true keeps winning the
+        // precedence (bug observed 2026-06-10). So if the link specifies ANY of
+        // the three, resolve its intended mode and write all three explicitly
+        // (mutual exclusion). A link carrying none of them keeps the current mode.
+        if s.useWrapA != nil || s.useSrtp != nil || s.useWrap != nil {
+            let wrapA = s.useWrapA ?? false
+            let srtp  = s.useSrtp ?? false
+            let wrap  = s.useWrap ?? false
+            d.set(wrapA, forKey: "useWrapA")
+            d.set(!wrapA && srtp, forKey: "useSrtp")
+            d.set(!wrapA && !srtp && wrap, forKey: "useWrap")
+        }
+        // useUDP optional in ConnectionSettings (added build 128): nil keeps
+        // the device's current value (default false / TCP).
         if let v = s.useUDP { d.set(v, forKey: "useUDP") }
-        // WRAP-A mode + password (the 1-click amurcanov payload) — nil-
-        // preserves-default like the toggles above.
-        if let v = s.useWrapA { d.set(v, forKey: "useWrapA") }
+        // wrapAPassword: nil-preserve (only meaningful in WRAP-A mode).
         if let v = s.wrapAPassword { d.set(v, forKey: "wrapAPassword") }
         if let v = s.turnServerOverride { d.set(v, forKey: "turnServerOverride") }
         if let v = s.dnsServers { d.set(v, forKey: "dnsServers") }
         if let v = s.numConnections { d.set(v, forKey: "numConnections") }
-        // Truncate vkLink and peerAddress in the log so we don't dump
-        // long token URLs into a file the user might share for triage.
+        // Log the RESOLVED server mode (read back after applying) — that's the
+        // field whose stale value caused the 2026-06-10 import bug, so it's the
+        // useful thing to see in triage.
         let nc = s.numConnections.map(String.init) ?? "(kept default)"
         let dn = s.dnsServers ?? "(kept default)"
-        let dtlsStr = s.useDTLS.map(String.init(describing:)) ?? "(kept default)"
-        let wrapStr = s.useWrap.map(String.init(describing:)) ?? "(kept default)"
-        SharedLogger.shared.log("[AppDebug] Backup: applied connection link (peer=\(s.peerAddress), useDTLS=\(dtlsStr), useWrap=\(wrapStr), numConnections=\(nc), dnsServers=\(dn))")
+        let mode = d.bool(forKey: "useWrapA") ? "SRTP-WRAP-A"
+                 : d.bool(forKey: "useSrtp")  ? "SRTP"
+                 : d.bool(forKey: "useWrap")  ? "SRTP+WRAP" : "legacy"
+        SharedLogger.shared.log("[AppDebug] Backup: applied connection link (peer=\(s.peerAddress), mode=\(mode), numConnections=\(nc), dnsServers=\(dn))")
     }
 }
