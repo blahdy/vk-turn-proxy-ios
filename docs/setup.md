@@ -80,13 +80,11 @@ https://github.com/samosvalishe/vk-turn-proxy/releases
 - приватный ключ клиента (он должен соответствовать публичному ключу в одном из разделов [Peer] на стороне WireGuard сервера)
 - публичный ключ WireGuard сервера
 - опционально preshared key (должен соответствовать PresharedKey в одном из разделов [Peer] на стороне WireGuard сервера, в общем случае оставляем пустым)
-
-<img width="750" height="619" alt="image" src="https://github.com/user-attachments/assets/ad317802-cdaf-4c46-9cc6-614067c74454" />
-
 - IP адрес и маску (должны соответствовать AllowedIPs в одном из разделов [Peer] на стороне WireGuard сервера)
 - IP адрес DNS сервера, который будет использоваться поверх туннеля
 
-<img width="750" height="415" alt="image" src="https://github.com/user-attachments/assets/51e1a4ab-89f7-4633-bbce-dae4684cc952" />
+<img width="750" height="1011" alt="image" src="https://github.com/user-attachments/assets/5cebef17-b39b-41db-9424-6c0e96d0e724" />
+
 
 ### SRTP-WRAP режим
 
