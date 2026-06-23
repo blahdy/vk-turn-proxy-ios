@@ -3121,7 +3121,7 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 	// Determine address family
 	var addrFamily turn.RequestedAddressFamily
 	if p.peer.IP.To4() != nil {
-		addrFamily = turn.RequestedAddressFamilyIPv4
+		addrFamily = turn.RequestedAddressFamilyIPv6
 	} else {
 		addrFamily = turn.RequestedAddressFamilyIPv6
 	}
@@ -4709,7 +4709,7 @@ func (p *Proxy) setupSRTPSession(ctx context.Context, turnAddr string, creds *TU
 		Software:               "vk-turn-srtp",
 		// Custom factory (not pion's default LogLevelError) so SRTP-path TURN refresh/auth failures feed the silent-degradation watchdog + get sanitized, matching runTURN.
 		LoggerFactory:          &turnLoggerFactory{proxy: p, slot: credSlot},
-		RequestedAddressFamily: turn.RequestedAddressFamilyIPv4,
+		RequestedAddressFamily: turn.RequestedAddressFamilyIPv6,
 	})
 	if err != nil {
 		_ = ctlConn.Close()
